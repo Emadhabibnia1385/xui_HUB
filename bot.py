@@ -2,7 +2,7 @@ import os
 import json
 import re
 import asyncio
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple
 
 import paramiko
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -65,6 +65,9 @@ def inbound_id_by_port_cmd(db_path: str, port: int) -> str:
     return f"""sudo sqlite3 "{db_path}" "SELECT id FROM inbounds WHERE port={port} ORDER BY id DESC LIMIT 1;" """
 
 def make_merge_script() -> str:
+    # Dual-mode:
+    # - If table `clients` exists -> merge rows into clients
+    # - else -> merge JSON clients inside inbounds.settings
     return r"""
 set -e
 DB="$1"
@@ -72,34 +75,124 @@ TARGET_ID="$2"
 SRC_IDS="$3"
 
 command -v sqlite3 >/dev/null 2>&1 || { echo "ERR_NO_SQLITE3"; exit 10; }
+command -v python3 >/dev/null 2>&1 || { echo "ERR_NO_PYTHON3"; exit 13; }
 
-COLS=$(sudo sqlite3 "$DB" "SELECT group_concat(name, ',') FROM pragma_table_info('clients') WHERE name NOT IN ('id','inbound_id');")
-if [ -z "$COLS" ]; then
-  echo "ERR_NO_CLIENTS_TABLE"
-  exit 11
+# backup db (best-effort)
+sudo cp "$DB" "/tmp/xuihub_db_backup_$(date +%s).db" >/dev/null 2>&1 || true
+
+HAS_CLIENTS=$(sudo sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='clients';")
+
+if [ "$HAS_CLIENTS" != "0" ]; then
+  # ---- Mode A: clients table exists ----
+  COLS=$(sudo sqlite3 "$DB" "SELECT group_concat(name, ',') FROM pragma_table_info('clients') WHERE name NOT IN ('id','inbound_id');")
+  if [ -z "$COLS" ]; then
+    echo "ERR_NO_CLIENTS_TABLE"
+    exit 11
+  fi
+
+  HAS_UUID=$(sudo sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('clients') WHERE name='uuid';")
+  if [ "$HAS_UUID" = "0" ]; then
+    echo "ERR_NO_UUID"
+    exit 12
+  fi
+
+  SELS=$(echo "$COLS" | awk -F',' '{for(i=1;i<=NF;i++){printf "c.%s", $i; if(i<NF) printf ","}}')
+
+  BEFORE=$(sudo sqlite3 "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
+
+  sudo sqlite3 "$DB" "BEGIN;
+  INSERT INTO clients (inbound_id, $COLS)
+  SELECT $TARGET_ID, $SELS
+  FROM clients c
+  WHERE c.inbound_id IN ($SRC_IDS)
+    AND c.uuid NOT IN (SELECT uuid FROM clients WHERE inbound_id=$TARGET_ID);
+  COMMIT;"
+
+  AFTER=$(sudo sqlite3 "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
+  ADDED=$((AFTER-BEFORE))
+  echo "OK_MODE=TABLE OK_ADDED=$ADDED BEFORE=$BEFORE AFTER=$AFTER"
+  exit 0
 fi
 
-HAS_UUID=$(sudo sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('clients') WHERE name='uuid';")
-if [ "$HAS_UUID" = "0" ]; then
-  echo "ERR_NO_UUID"
-  exit 12
-fi
+# ---- Mode B: clients table NOT exists -> merge JSON in inbounds.settings ----
+python3 - <<'PY' "$DB" "$TARGET_ID" "$SRC_IDS"
+import json, sqlite3, sys
 
-SELS=$(echo "$COLS" | awk -F',' '{for(i=1;i<=NF;i++){printf "c.%s", $i; if(i<NF) printf ","}}')
+db = sys.argv[1]
+target_id = int(sys.argv[2])
+src_ids = [int(x) for x in sys.argv[3].split(",") if x.strip()]
 
-BEFORE=$(sudo sqlite3 "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
+con = sqlite3.connect(db)
+cur = con.cursor()
 
-sudo sqlite3 "$DB" "BEGIN;
-INSERT INTO clients (inbound_id, $COLS)
-SELECT $TARGET_ID, $SELS
-FROM clients c
-WHERE c.inbound_id IN ($SRC_IDS)
-  AND c.uuid NOT IN (SELECT uuid FROM clients WHERE inbound_id=$TARGET_ID);
-COMMIT;"
+cur.execute("PRAGMA table_info(inbounds);")
+cols = [r[1] for r in cur.fetchall()]
 
-AFTER=$(sudo sqlite3 "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
-ADDED=$((AFTER-BEFORE))
-echo "OK_ADDED=$ADDED BEFORE=$BEFORE AFTER=$AFTER"
+# find settings column name
+settings_col = None
+for cand in ("settings", "setting", "settingsJson", "settings_json"):
+    if cand in cols:
+        settings_col = cand
+        break
+
+if not settings_col:
+    print("ERR_NO_SETTINGS_COL")
+    sys.exit(20)
+
+def load_settings(inbound_id: int):
+    cur.execute(f"SELECT {settings_col} FROM inbounds WHERE id=?", (inbound_id,))
+    row = cur.fetchone()
+    s = row[0] if row else None
+    if not s:
+        return {}
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+def save_settings(inbound_id: int, obj: dict):
+    s = json.dumps(obj, ensure_ascii=False)
+    cur.execute(f"UPDATE inbounds SET {settings_col}=? WHERE id=?", (s, inbound_id))
+
+tset = load_settings(target_id)
+tclients = tset.get("clients") or []
+if not isinstance(tclients, list):
+    tclients = []
+
+def client_key(c: dict):
+    for k in ("uuid","id","email","password"):
+        v = c.get(k)
+        if isinstance(v,str) and v.strip():
+            return (k, v.strip())
+    return ("raw", json.dumps(c, sort_keys=True, ensure_ascii=False))
+
+existing = set()
+for c in tclients:
+    if isinstance(c, dict):
+        existing.add(client_key(c))
+
+added = 0
+for sid in src_ids:
+    sset = load_settings(sid)
+    sclients = sset.get("clients") or []
+    if not isinstance(sclients, list):
+        continue
+    for c in sclients:
+        if not isinstance(c, dict):
+            continue
+        k = client_key(c)
+        if k in existing:
+            continue
+        tclients.append(c)
+        existing.add(k)
+        added += 1
+
+tset["clients"] = tclients
+save_settings(target_id, tset)
+con.commit()
+con.close()
+print(f"OK_MODE=JSON OK_ADDED={added} TARGET_CLIENTS={len(tclients)} SETTINGS_COL={settings_col}")
+PY
 """
 
 # ---------------- Telegram states ----------------
@@ -134,12 +227,6 @@ def kb_panel_actions(pid: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ برگشت", callback_data="manage_panels")]
     ])
 
-def kb_edit_choose(pid: str) -> InlineKeyboardMarkup:
-    # ساده: برای ویرایش، یک پیام می‌گیریم به شکل key=value
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ برگشت", callback_data="manage_panels")]
-    ])
-
 def env_required(name: str) -> str:
     v = os.getenv(name, "").strip()
     if not v:
@@ -150,7 +237,7 @@ def env_required(name: str) -> str:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("xui_HUB آماده است ✅", reply_markup=kb_main())
 
-# ---------------- Navigation (callbacks that are NOT part of step-by-step) ----------------
+# ---------------- Navigation callbacks (non-step flows) ----------------
 async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -166,12 +253,10 @@ async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("مدیریت پنل‌ها:", reply_markup=kb_panels(store, user_id))
         return
 
-    # Start-menu merge -> user must select a panel
     if q.data == "start_merge":
         if not bucket["order"]:
             await q.edit_message_text("اول یک پنل اضافه کن.", reply_markup=kb_panels(store, user_id))
             return
-        # show list of panels; clicking each will start merge flow (merge:<pid>)
         rows = []
         for pid in bucket["order"]:
             rows.append([InlineKeyboardButton(f"🔀 {pid}", callback_data=f"merge:{pid}")])
@@ -212,12 +297,11 @@ async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "فیلدها:\n"
             "panel_host, panel_scheme(http/https), panel_port, panel_path,\n"
             "panel_user, panel_pass, ssh_host, ssh_user, ssh_port, ssh_pass",
-            reply_markup=kb_edit_choose(pid),
             parse_mode="Markdown"
         )
         return
 
-# ---------------- Add panel flow ----------------
+# ---------------- Add panel (step flow) ----------------
 async def add_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_panel"] = {"panel_host": update.message.text.strip()}
     await update.message.reply_text("۲) نوع پنل؟ HTTP یا HTTPS")
@@ -363,7 +447,36 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ ویرایش انجام شد.", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ---------------- Merge flow ----------------
+# ---------------- Merge entry + step flow ----------------
+async def add_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.clear()
+    await q.edit_message_text("۱) آیپی یا دامنه پنل را بفرست:")
+    return ADD_IP
+
+async def merge_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    store = load_store()
+    user_id = update.effective_user.id
+    bucket = get_user_bucket(store, user_id)
+
+    pid = q.data.split(":", 1)[1]
+    if pid not in bucket["panels"]:
+        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["merge"] = {"panel_id": pid, "ports": []}
+    await q.edit_message_text(
+        "🔀 ادغام پورت‌ها\n\n"
+        "⚠️ پورت مقصد را خودتان از قبل داخل پنل ساخته باشید.\n\n"
+        "تعداد پورت‌های ورودی را بفرست (مثلاً 2):"
+    )
+    return MERGE_COUNT
+
 async def merge_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         n = int(update.message.text.strip())
@@ -508,67 +621,13 @@ sudo $TMP "{db_path}" "{target_id}" "{src_ids_csv}"
     await update.message.reply_text(f"✅ ادغام انجام شد.\n{out.strip()}", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ---------------- Callback entrypoints that START conversations ----------------
-async def add_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    context.user_data.clear()
-    await q.edit_message_text("۱) آیپی یا دامنه پنل را بفرست:")
-    return ADD_IP
-
-async def merge_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    store = load_store()
-    user_id = update.effective_user.id
-    bucket = get_user_bucket(store, user_id)
-
-    pid = q.data.split(":", 1)[1]
-    if pid not in bucket["panels"]:
-        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
-        return ConversationHandler.END
-
-    context.user_data.clear()
-    context.user_data["merge"] = {"panel_id": pid, "ports": []}
-    await q.edit_message_text(
-        "🔀 ادغام پورت‌ها\n\n"
-        "⚠️ پورت مقصد را خودتان از قبل داخل پنل ساخته باشید.\n\n"
-        "تعداد پورت‌های ورودی را بفرست (مثلاً 2):"
-    )
-    return MERGE_COUNT
-
-async def edit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    store = load_store()
-    user_id = update.effective_user.id
-    bucket = get_user_bucket(store, user_id)
-
-    pid = q.data.split(":", 1)[1]
-    if pid not in bucket["panels"]:
-        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
-        return ConversationHandler.END
-
-    context.user_data.clear()
-    context.user_data["edit_pid"] = pid
-    await q.edit_message_text(
-        "✏️ ویرایش پنل\n\n"
-        "به این شکل بفرست:\n"
-        "`field=value`\n\n"
-        "فیلدها:\n"
-        "panel_host, panel_scheme(http/https), panel_port, panel_path,\n"
-        "panel_user, panel_pass, ssh_host, ssh_user, ssh_port, ssh_pass",
-        parse_mode="Markdown"
-    )
-    return EDIT_VALUE
-
 def main():
     token = env_required("TOKEN")
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
 
-    # IMPORTANT: ConversationHandlers FIRST (so they receive callback updates)
+    # IMPORTANT: Conversation handlers FIRST
     conv_add = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_panel_entry, pattern="^add_panel$")],
         states={
@@ -602,16 +661,15 @@ def main():
     app.add_handler(conv_merge)
 
     conv_edit = ConversationHandler(
-        entry_points=[CallbackQueryHandler(edit_entry, pattern=r"^edit:")],
-        states={
-            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
-        },
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
+        states={EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)]},
         fallbacks=[],
         allow_reentry=True,
     )
+    # NOTE: conv_edit is triggered by context.user_data["edit_pid"] being set in nav_callbacks
     app.add_handler(conv_edit)
 
-    # Navigation callbacks AFTER conversation handlers
+    # navigation callbacks AFTER conversations
     app.add_handler(CallbackQueryHandler(nav_callbacks))
 
     app.run_polling()

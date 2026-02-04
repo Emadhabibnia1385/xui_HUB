@@ -13,6 +13,7 @@ from telegram.ext import (
 
 STORE_FILE = "store.json"
 
+# ---------------- Storage: only panels are stored (per-user) ----------------
 def load_store() -> Dict[str, Any]:
     if not os.path.exists(STORE_FILE):
         return {"users": {}}
@@ -25,21 +26,20 @@ def save_store(data: Dict[str, Any]) -> None:
 
 def get_user_bucket(store: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     uid = str(user_id)
-    if "users" not in store:
-        store["users"] = {}
-    if uid not in store["users"]:
-        store["users"][uid] = {"panels": {}, "order": []}
+    store.setdefault("users", {})
+    store["users"].setdefault(uid, {"panels": {}, "order": []})
     return store["users"][uid]
 
 def safe_panel_id(host: str) -> str:
     pid = re.sub(r"[^a-zA-Z0-9_.-]+", "_", host.strip())
     return pid or "panel"
 
+# ---------------- SSH helpers ----------------
 def ssh_exec(host: str, port: int, user: str, password: str, cmd: str, timeout: int = 25) -> Tuple[int, str, str]:
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(hostname=host, port=port, username=user, password=password, timeout=timeout)
-    stdin, stdout, stderr = client.exec_command(cmd, get_pty=True)
+    _, stdout, stderr = client.exec_command(cmd, get_pty=True)
     out = stdout.read().decode("utf-8", errors="ignore")
     err = stderr.read().decode("utf-8", errors="ignore")
     code = stdout.channel.recv_exit_status()
@@ -65,7 +65,6 @@ def inbound_id_by_port_cmd(db_path: str, port: int) -> str:
     return f"""sudo sqlite3 "{db_path}" "SELECT id FROM inbounds WHERE port={port} ORDER BY id DESC LIMIT 1;" """
 
 def make_merge_script() -> str:
-    # merges clients into target inbound, prevents uuid duplicates
     return r"""
 set -e
 DB="$1"
@@ -103,16 +102,19 @@ ADDED=$((AFTER-BEFORE))
 echo "OK_ADDED=$ADDED BEFORE=$BEFORE AFTER=$AFTER"
 """
 
-# ----------------- Telegram states -----------------
+# ---------------- Telegram states ----------------
 (
     ADD_IP, ADD_HTTP, ADD_PANEL_PORT, ADD_PATH, ADD_USER, ADD_PASS,
     ADD_SSH_HOST, ADD_SSH_USER, ADD_SSH_PORT, ADD_SSH_PASS,
     MERGE_COUNT, MERGE_PORTS, MERGE_TARGET, MERGE_CONFIRM,
-    EDIT_CHOOSE_FIELD, EDIT_VALUE
-) = range(16)
+    EDIT_VALUE
+) = range(15)
 
 def kb_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🛠 مدیریت پنل‌ها", callback_data="manage_panels")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛠 مدیریت پنل‌ها", callback_data="manage_panels")],
+        [InlineKeyboardButton("🔀 ادغام پورت‌ها", callback_data="start_merge")]
+    ])
 
 def kb_panels(store: Dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
     bucket = get_user_bucket(store, user_id)
@@ -132,124 +134,92 @@ def kb_panel_actions(pid: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ برگشت", callback_data="manage_panels")]
     ])
 
-def kb_edit_fields(pid: str) -> InlineKeyboardMarkup:
-    # کاربر انتخاب می‌کند کدام فیلد را ویرایش کند
+def kb_edit_choose(pid: str) -> InlineKeyboardMarkup:
+    # ساده: برای ویرایش، یک پیام می‌گیریم به شکل key=value
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("پنل: IP/دامنه", callback_data=f"ef:{pid}:panel_host")],
-        [InlineKeyboardButton("HTTP/HTTPS", callback_data=f"ef:{pid}:panel_scheme")],
-        [InlineKeyboardButton("پورت پنل", callback_data=f"ef:{pid}:panel_port")],
-        [InlineKeyboardButton("پچ پنل", callback_data=f"ef:{pid}:panel_path")],
-        [InlineKeyboardButton("یوزرنیم پنل", callback_data=f"ef:{pid}:panel_user")],
-        [InlineKeyboardButton("پسورد پنل", callback_data=f"ef:{pid}:panel_pass")],
-        [InlineKeyboardButton("SSH Host", callback_data=f"ef:{pid}:ssh_host")],
-        [InlineKeyboardButton("SSH User", callback_data=f"ef:{pid}:ssh_user")],
-        [InlineKeyboardButton("SSH Port", callback_data=f"ef:{pid}:ssh_port")],
-        [InlineKeyboardButton("SSH Pass", callback_data=f"ef:{pid}:ssh_pass")],
         [InlineKeyboardButton("⬅️ برگشت", callback_data="manage_panels")]
     ])
 
-def field_label(key: str) -> str:
-    m = {
-        "panel_host":"IP/دامنه پنل",
-        "panel_scheme":"HTTP/HTTPS",
-        "panel_port":"پورت پنل",
-        "panel_path":"پچ پنل",
-        "panel_user":"یوزرنیم پنل",
-        "panel_pass":"پسورد پنل",
-        "ssh_host":"IP/دامنه سرور (SSH)",
-        "ssh_user":"یوزرنیم SSH",
-        "ssh_port":"پورت SSH",
-        "ssh_pass":"پسورد SSH",
-    }
-    return m.get(key, key)
+def env_required(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        raise RuntimeError(f"Missing env: {name}")
+    return v
 
+# ---------------- /start ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("xui_HUB آماده است ✅", reply_markup=kb_main())
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------------- Navigation (callbacks that are NOT part of step-by-step) ----------------
+async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     store = load_store()
     user_id = update.effective_user.id
+    bucket = get_user_bucket(store, user_id)
 
     if q.data == "back_main":
         await q.edit_message_text("منوی اصلی:", reply_markup=kb_main())
-        return ConversationHandler.END
+        return
 
     if q.data == "manage_panels":
         await q.edit_message_text("مدیریت پنل‌ها:", reply_markup=kb_panels(store, user_id))
-        return ConversationHandler.END
+        return
 
-    if q.data == "add_panel":
-        context.user_data.clear()
-        context.user_data["new_panel"] = {}
-        await q.edit_message_text("۱) آیپی یا دامنه پنل را بفرست:")
-        return ADD_IP
+    # Start-menu merge -> user must select a panel
+    if q.data == "start_merge":
+        if not bucket["order"]:
+            await q.edit_message_text("اول یک پنل اضافه کن.", reply_markup=kb_panels(store, user_id))
+            return
+        # show list of panels; clicking each will start merge flow (merge:<pid>)
+        rows = []
+        for pid in bucket["order"]:
+            rows.append([InlineKeyboardButton(f"🔀 {pid}", callback_data=f"merge:{pid}")])
+        rows.append([InlineKeyboardButton("⬅️ برگشت", callback_data="back_main")])
+        await q.edit_message_text("پنلی که می‌خوای روی اون ادغام انجام بشه رو انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
+        return
 
-    # انتخاب پنل
     if q.data.startswith("panel:"):
         pid = q.data.split(":", 1)[1]
-        bucket = get_user_bucket(store, user_id)
         if pid not in bucket["panels"]:
             await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
-            return ConversationHandler.END
+            return
+        context.user_data.clear()
         context.user_data["selected_pid"] = pid
         await q.edit_message_text(f"پنل انتخاب شد: {pid}", reply_markup=kb_panel_actions(pid))
-        return ConversationHandler.END
+        return
 
-    # حذف پنل
     if q.data.startswith("del:"):
         pid = q.data.split(":", 1)[1]
-        bucket = get_user_bucket(store, user_id)
         if pid in bucket["panels"]:
             del bucket["panels"][pid]
             bucket["order"] = [x for x in bucket["order"] if x != pid]
             save_store(store)
         await q.edit_message_text("✅ حذف شد.", reply_markup=kb_panels(store, user_id))
-        return ConversationHandler.END
+        return
 
-    # ویرایش پنل → انتخاب فیلد
     if q.data.startswith("edit:"):
         pid = q.data.split(":", 1)[1]
-        bucket = get_user_bucket(store, user_id)
         if pid not in bucket["panels"]:
             await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
-            return ConversationHandler.END
+            return
         context.user_data.clear()
         context.user_data["edit_pid"] = pid
-        await q.edit_message_text(f"✏️ ویرایش پنل: {pid}\nیک فیلد را انتخاب کن:", reply_markup=kb_edit_fields(pid))
-        return EDIT_CHOOSE_FIELD
-
-    # انتخاب فیلد برای ویرایش
-    if q.data.startswith("ef:"):
-        _, pid, key = q.data.split(":", 2)
-        context.user_data["edit_pid"] = pid
-        context.user_data["edit_key"] = key
-        await q.edit_message_text(f"مقدار جدید برای «{field_label(key)}» را بفرست:")
-        return EDIT_VALUE
-
-    # ادغام
-    if q.data.startswith("merge:"):
-        pid = q.data.split(":", 1)[1]
-        bucket = get_user_bucket(store, user_id)
-        if pid not in bucket["panels"]:
-            await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
-            return ConversationHandler.END
-
-        context.user_data.clear()
-        context.user_data["merge"] = {"panel_id": pid, "ports": []}
         await q.edit_message_text(
-            "🔀 ادغام پورت‌ها\n\n"
-            "⚠️ پورت مقصد را خودتان از قبل داخل پنل ساخته باشید.\n\n"
-            "تعداد پورت‌های ورودی را بفرست (مثلاً 2):"
+            "✏️ ویرایش پنل\n\n"
+            "به این شکل بفرست:\n"
+            "`field=value`\n\n"
+            "فیلدها:\n"
+            "panel_host, panel_scheme(http/https), panel_port, panel_path,\n"
+            "panel_user, panel_pass, ssh_host, ssh_user, ssh_port, ssh_pass",
+            reply_markup=kb_edit_choose(pid),
+            parse_mode="Markdown"
         )
-        return MERGE_COUNT
+        return
 
-    return ConversationHandler.END
-
-# ---- Add panel flow ----
+# ---------------- Add panel flow ----------------
 async def add_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_panel"]["panel_host"] = update.message.text.strip()
+    context.user_data["new_panel"] = {"panel_host": update.message.text.strip()}
     await update.message.reply_text("۲) نوع پنل؟ HTTP یا HTTPS")
     return ADD_HTTP
 
@@ -259,7 +229,7 @@ async def add_http(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("فقط HTTP یا HTTPS بفرست.")
         return ADD_HTTP
     context.user_data["new_panel"]["panel_scheme"] = v
-    await update.message.reply_text("۳) پورت پنل؟ (مثلاً 2053)")
+    await update.message.reply_text("۳) پورت پنل؟")
     return ADD_PANEL_PORT
 
 async def add_panel_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -333,25 +303,32 @@ async def add_ssh_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bucket["order"].append(pid)
     save_store(store)
 
-    context.user_data.clear()  # پاک شدن دیتاهای موقت
-    await update.message.reply_text("✅ پنل ذخیره شد. /start")
+    context.user_data.clear()
+    await update.message.reply_text("✅ پنل ذخیره شد.", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ---- Edit flow ----
+# ---------------- Edit flow (field=value) ----------------
 async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    store = load_store()
-    user_id = update.effective_user.id
-    bucket = get_user_bucket(store, user_id)
-
     pid = context.user_data.get("edit_pid")
-    key = context.user_data.get("edit_key")
-    if not pid or not key or pid not in bucket["panels"]:
-        context.user_data.clear()
-        await update.message.reply_text("❌ خطا. دوباره از مدیریت پنل‌ها شروع کن. /start")
+    if not pid:
+        await update.message.reply_text("❌ اول از مدیریت پنل‌ها وارد ویرایش شو.", reply_markup=kb_main())
         return ConversationHandler.END
 
-    val = update.message.text.strip()
-    if key in ("panel_port", "ssh_port"):
+    text = update.message.text.strip()
+    if "=" not in text:
+        await update.message.reply_text("فرمت درست: field=value")
+        return EDIT_VALUE
+
+    key, val = text.split("=", 1)
+    key = key.strip()
+    val = val.strip()
+
+    allowed = {"panel_host","panel_scheme","panel_port","panel_path","panel_user","panel_pass","ssh_host","ssh_user","ssh_port","ssh_pass"}
+    if key not in allowed:
+        await update.message.reply_text("نام فیلد اشتباهه. دوباره بفرست.")
+        return EDIT_VALUE
+
+    if key in ("panel_port","ssh_port"):
         try:
             v = int(val)
             if not (1 <= v <= 65535):
@@ -360,24 +337,33 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             await update.message.reply_text("پورت معتبر بفرست (1..65535).")
             return EDIT_VALUE
-    elif key == "panel_scheme":
+
+    if key == "panel_scheme":
         v = val.lower()
-        if v not in ("http", "https"):
-            await update.message.reply_text("فقط HTTP یا HTTPS بفرست.")
+        if v not in ("http","https"):
+            await update.message.reply_text("فقط http یا https")
             return EDIT_VALUE
         val = v
-    elif key == "panel_path":
+
+    if key == "panel_path":
         if not val.startswith("/"):
             val = "/" + val
+
+    store = load_store()
+    bucket = get_user_bucket(store, update.effective_user.id)
+    if pid not in bucket["panels"]:
+        context.user_data.clear()
+        await update.message.reply_text("پنل پیدا نشد.", reply_markup=kb_main())
+        return ConversationHandler.END
 
     bucket["panels"][pid][key] = val
     save_store(store)
 
     context.user_data.clear()
-    await update.message.reply_text("✅ ویرایش انجام شد. /start")
+    await update.message.reply_text("✅ ویرایش انجام شد.", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ---- Merge flow ----
+# ---------------- Merge flow ----------------
 async def merge_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         n = int(update.message.text.strip())
@@ -423,9 +409,9 @@ async def merge_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     m["target_port"] = port
     await update.message.reply_text(
-        "🧾 خلاصه:\n"
-        f"پورت‌های ورودی: {m['ports']}\n"
-        f"پورت مقصد: {m['target_port']}\n\n"
+        "⚠️ پورت مقصد باید از قبل داخل پنل ساخته شده باشد.\n\n"
+        f"ورودی‌ها: {m['ports']}\n"
+        f"مقصد: {m['target_port']}\n\n"
         "برای اجرای عملیات بنویس: OK"
     )
     return MERGE_CONFIRM
@@ -443,7 +429,7 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     panel = bucket["panels"].get(pid)
     if not panel:
         context.user_data.clear()
-        await update.message.reply_text("❌ پنل پیدا نشد. /start")
+        await update.message.reply_text("❌ پنل پیدا نشد.", reply_markup=kb_main())
         return ConversationHandler.END
 
     src_ports = context.user_data["merge"]["ports"]
@@ -451,7 +437,6 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("⏳ در حال اتصال به سرور و ادغام...")
 
-    # find db
     code, out, err = await asyncio.to_thread(
         ssh_exec,
         panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
@@ -460,24 +445,19 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_path = out.strip().splitlines()[-1] if out.strip() else ""
     if "NOT_FOUND" in db_path or not db_path:
         context.user_data.clear()
-        await update.message.reply_text("❌ دیتابیس x-ui.db پیدا نشد یا دسترسی sudo ندارم.")
+        await update.message.reply_text("❌ دیتابیس x-ui.db پیدا نشد یا دسترسی sudo ندارم.", reply_markup=kb_main())
         return ConversationHandler.END
 
     def get_inbound_id(port: int) -> Optional[int]:
         c, o, e = ssh_exec(panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
                           inbound_id_by_port_cmd(db_path, port))
         v = o.strip()
-        if not v:
-            return None
-        try:
-            return int(v)
-        except:
-            return None
+        return int(v) if v.isdigit() else None
 
     target_id = await asyncio.to_thread(get_inbound_id, target_port)
     if not target_id:
         context.user_data.clear()
-        await update.message.reply_text(f"❌ inbound با پورت مقصد {target_port} پیدا نشد. اول داخل پنل بساز.")
+        await update.message.reply_text(f"❌ inbound مقصد با پورت {target_port} پیدا نشد. اول داخل پنل بساز.", reply_markup=kb_main())
         return ConversationHandler.END
 
     source_ids = []
@@ -491,7 +471,7 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if missing:
         context.user_data.clear()
-        await update.message.reply_text(f"❌ این پورت‌ها inbound ندارند/پیدا نشدند: {missing}")
+        await update.message.reply_text(f"❌ این پورت‌ها inbound ندارند/پیدا نشدند: {missing}", reply_markup=kb_main())
         return ConversationHandler.END
 
     src_ids_csv = ",".join(str(x) for x in source_ids)
@@ -515,7 +495,7 @@ sudo $TMP "{db_path}" "{target_id}" "{src_ids_csv}"
     if code != 0:
         context.user_data.clear()
         msg = (out + "\n" + err).strip()
-        await update.message.reply_text(f"❌ خطا:\n{msg[:3500]}")
+        await update.message.reply_text(f"❌ خطا:\n{msg[:3500]}", reply_markup=kb_main())
         return ConversationHandler.END
 
     await asyncio.to_thread(
@@ -524,25 +504,73 @@ sudo $TMP "{db_path}" "{target_id}" "{src_ids_csv}"
         "sudo x-ui restart || sudo systemctl restart x-ui || true"
     )
 
-    context.user_data.clear()  # پاک شدن دیتاهای موقت
-    await update.message.reply_text(f"✅ ادغام انجام شد.\n{out.strip()}\n\n/start")
+    context.user_data.clear()
+    await update.message.reply_text(f"✅ ادغام انجام شد.\n{out.strip()}", reply_markup=kb_main())
     return ConversationHandler.END
 
-def env_required(name: str) -> str:
-    v = os.getenv(name, "").strip()
-    if not v:
-        raise RuntimeError(f"Missing env: {name}")
-    return v
+# ---------------- Callback entrypoints that START conversations ----------------
+async def add_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    context.user_data.clear()
+    await q.edit_message_text("۱) آیپی یا دامنه پنل را بفرست:")
+    return ADD_IP
+
+async def merge_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    store = load_store()
+    user_id = update.effective_user.id
+    bucket = get_user_bucket(store, user_id)
+
+    pid = q.data.split(":", 1)[1]
+    if pid not in bucket["panels"]:
+        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["merge"] = {"panel_id": pid, "ports": []}
+    await q.edit_message_text(
+        "🔀 ادغام پورت‌ها\n\n"
+        "⚠️ پورت مقصد را خودتان از قبل داخل پنل ساخته باشید.\n\n"
+        "تعداد پورت‌های ورودی را بفرست (مثلاً 2):"
+    )
+    return MERGE_COUNT
+
+async def edit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    store = load_store()
+    user_id = update.effective_user.id
+    bucket = get_user_bucket(store, user_id)
+
+    pid = q.data.split(":", 1)[1]
+    if pid not in bucket["panels"]:
+        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    context.user_data["edit_pid"] = pid
+    await q.edit_message_text(
+        "✏️ ویرایش پنل\n\n"
+        "به این شکل بفرست:\n"
+        "`field=value`\n\n"
+        "فیلدها:\n"
+        "panel_host, panel_scheme(http/https), panel_port, panel_path,\n"
+        "panel_user, panel_pass, ssh_host, ssh_user, ssh_port, ssh_pass",
+        parse_mode="Markdown"
+    )
+    return EDIT_VALUE
 
 def main():
     token = env_required("TOKEN")
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CallbackQueryHandler(on_callback))
 
+    # IMPORTANT: ConversationHandlers FIRST (so they receive callback updates)
     conv_add = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_callback, pattern="^add_panel$")],
+        entry_points=[CallbackQueryHandler(add_panel_entry, pattern="^add_panel$")],
         states={
             ADD_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ip)],
             ADD_HTTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_http)],
@@ -560,19 +588,8 @@ def main():
     )
     app.add_handler(conv_add)
 
-    conv_edit = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_callback, pattern=r"^edit:") , CallbackQueryHandler(on_callback, pattern=r"^ef:")],
-        states={
-            EDIT_CHOOSE_FIELD: [CallbackQueryHandler(on_callback, pattern=r"^ef:")],
-            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
-        },
-        fallbacks=[],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_edit)
-
     conv_merge = ConversationHandler(
-        entry_points=[CallbackQueryHandler(on_callback, pattern=r"^merge:")],
+        entry_points=[CallbackQueryHandler(merge_entry, pattern=r"^merge:")],
         states={
             MERGE_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, merge_count)],
             MERGE_PORTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, merge_ports)],
@@ -583,6 +600,19 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv_merge)
+
+    conv_edit = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_entry, pattern=r"^edit:")],
+        states={
+            EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value)],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_edit)
+
+    # Navigation callbacks AFTER conversation handlers
+    app.add_handler(CallbackQueryHandler(nav_callbacks))
 
     app.run_polling()
 

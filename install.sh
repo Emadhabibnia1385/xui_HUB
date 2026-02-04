@@ -69,7 +69,7 @@ clone_or_update_repo() {
     cd "$DIR"
   fi
 
-  [[ -f "$DIR/bot.py" ]] || err "bot.py not found after download. Repo content missing?"
+  [[ -f "$DIR/bot.py" ]] || err "bot.py not found after download."
   [[ -f "$DIR/requirements.txt" ]] || err "requirements.txt not found after download."
 }
 
@@ -89,12 +89,8 @@ configure_env() {
   read -r -p "Enter your Telegram Bot TOKEN: " BOT_TOKEN
   [[ -n "${BOT_TOKEN// }" ]] || err "TOKEN cannot be empty"
 
-  read -r -p "Enter your Admin Chat ID (numeric): " ADMIN_ID
-  [[ "$ADMIN_ID" =~ ^-?[0-9]+$ ]] || err "ADMIN_CHAT_ID must be numeric"
-
   cat > "$DIR/.env" << EOF
 TOKEN=$BOT_TOKEN
-ADMIN_CHAT_ID=$ADMIN_ID
 EOF
   chmod 600 "$DIR/.env"
 }
@@ -198,62 +194,17 @@ main() {
     read -r -p "Select option [0-9]: " choice
 
     case "${choice:-}" in
-      1)
-        install_bot
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      2)
-        update_bot
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      3)
-        edit_config
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      4)
-        systemctl start "$SERVICE"
-        ok "Bot started"
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      5)
-        systemctl stop "$SERVICE"
-        ok "Bot stopped"
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      6)
-        systemctl restart "$SERVICE"
-        ok "Bot restarted"
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      7)
-        echo -e "${Y}Press Ctrl+C to exit logs${N}"
-        sleep 1
-        journalctl -u "$SERVICE" -f
-        ;;
-      8)
-        systemctl status "$SERVICE" --no-pager -l
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      9)
-        remove_bot
-        echo ""
-        read -r -p "Press Enter to continue..."
-        ;;
-      0)
-        echo "Goodbye!"
-        exit 0
-        ;;
-      *)
-        echo -e "${R}Invalid option${N}"
-        sleep 1
-        ;;
+      1) install_bot; echo ""; read -r -p "Press Enter to continue..." ;;
+      2) update_bot; echo ""; read -r -p "Press Enter to continue..." ;;
+      3) edit_config; echo ""; read -r -p "Press Enter to continue..." ;;
+      4) systemctl start "$SERVICE"; ok "Bot started"; echo ""; read -r -p "Press Enter to continue..." ;;
+      5) systemctl stop "$SERVICE"; ok "Bot stopped"; echo ""; read -r -p "Press Enter to continue..." ;;
+      6) systemctl restart "$SERVICE"; ok "Bot restarted"; echo ""; read -r -p "Press Enter to continue..." ;;
+      7) echo -e "${Y}Press Ctrl+C to exit logs${N}"; sleep 1; journalctl -u "$SERVICE" -f ;;
+      8) systemctl status "$SERVICE" --no-pager -l; echo ""; read -r -p "Press Enter to continue..." ;;
+      9) remove_bot; echo ""; read -r -p "Press Enter to continue..." ;;
+      0) echo "Goodbye!"; exit 0 ;;
+      *) echo -e "${R}Invalid option${N}"; sleep 1 ;;
     esac
   done
 }

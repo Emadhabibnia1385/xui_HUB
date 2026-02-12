@@ -4,7 +4,7 @@ import re
 import asyncio
 import tempfile
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 import paramiko
 from telegram import (
@@ -25,7 +25,9 @@ from telegram.ext import (
 
 STORE_FILE = "store.json"
 
-# ------------------------- Storage (only panels are stored) -------------------------
+# =========================
+# Storage (servers + optional panel)
+# =========================
 def load_store() -> Dict[str, Any]:
     if not os.path.exists(STORE_FILE):
         return {"users": {}}
@@ -39,14 +41,16 @@ def save_store(data: Dict[str, Any]) -> None:
 def get_user_bucket(store: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     uid = str(user_id)
     store.setdefault("users", {})
-    store["users"].setdefault(uid, {"panels": {}, "order": []})
+    store["users"].setdefault(uid, {"servers": {}, "order": []})
     return store["users"][uid]
 
-def safe_panel_id(host: str) -> str:
-    pid = re.sub(r"[^a-zA-Z0-9_.-]+", "_", host.strip())
-    return pid or "panel"
+def safe_server_id(ip: str) -> str:
+    sid = re.sub(r"[^a-zA-Z0-9_.-]+", "_", ip.strip())
+    return sid or "server"
 
-# ------------------------- Jalali (Shamsi) conversion -------------------------
+# =========================
+# Jalali (Shamsi) conversion
+# =========================
 def gregorian_to_jalali(gy: int, gm: int, gd: int) -> Tuple[int, int, int]:
     g_d_m = [0,31,59,90,120,151,181,212,243,273,304,334]
     if gy > 1600:
@@ -78,7 +82,9 @@ PERSIAN_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 def to_fa_digits(s: str) -> str:
     return s.translate(PERSIAN_DIGITS)
 
-# ------------------------- SSH helpers -------------------------
+# =========================
+# SSH helpers
+# =========================
 def ssh_client(host: str, port: int, user: str, password: str, timeout: int = 25) -> paramiko.SSHClient:
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -115,6 +121,9 @@ fi
 
 def inbound_id_by_port_cmd(db_path: str, port: int) -> str:
     return f"""sudo sqlite3 "{db_path}" "SELECT id FROM inbounds WHERE port={port} ORDER BY id DESC LIMIT 1;" """
+
+def list_inbound_ports_cmd(db_path: str) -> str:
+    return f"""sudo sqlite3 "{db_path}" "SELECT port FROM inbounds ORDER BY port ASC;" """
 
 def make_merge_script() -> str:
     return r"""
@@ -240,26 +249,35 @@ print(f"OK_MODE=JSON OK_ADDED={added} TARGET_CLIENTS={len(tclients)} SETTINGS_CO
 PY
 """
 
-# ------------------------- Telegram states -------------------------
+# =========================
+# Telegram states
+# =========================
 (
-    ADD_IP, ADD_HTTP, ADD_PANEL_PORT, ADD_PATH, ADD_USER, ADD_PASS,
-    ADD_SSH_HOST, ADD_SSH_USER, ADD_SSH_PORT, ADD_SSH_PASS,
-
+    # merge
     MERGE_COUNT, MERGE_PORTS, MERGE_TARGET, MERGE_CONFIRM,
 
-    BK_MENU, BK_EXPORT_PICK_PANEL, BK_IMPORT_CHOOSE_MODE,
-    BK_IMPORT_PICK_PANEL, BK_IMPORT_UPLOAD_FILE, BK_IMPORT_CONFIRM,
+    # backup
+    BK_MENU, BK_EXPORT_PICK_SERVER, BK_IMPORT_CHOOSE_MODE,
+    BK_IMPORT_PICK_SERVER, BK_IMPORT_UPLOAD_FILE, BK_IMPORT_CONFIRM,
 
     BK_IMPORT_NEW_SSH_HOST, BK_IMPORT_NEW_SSH_USER, BK_IMPORT_NEW_SSH_PORT, BK_IMPORT_NEW_SSH_PASS,
     BK_IMPORT_NEW_UPLOAD_FILE, BK_IMPORT_NEW_CONFIRM,
 
-    EDIT_VALUE,
-) = range(27)
+    # add server + optional panel
+    SV_IP, SV_SSH_USER, SV_SSH_PASS, SV_SSH_PORT,
+    SV_ASK_ADD_PANEL, SV_PANEL_DOMAIN, SV_PANEL_SCHEME, SV_PANEL_PORT,
+    SV_PANEL_PATH, SV_PANEL_USER, SV_PANEL_PASS,
 
-# ------------------------- Keyboards -------------------------
+    # edit server (button based)
+    EDIT_MENU, EDIT_INPUT,
+) = range(29)
+
+# =========================
+# Keyboards
+# =========================
 def kb_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛠 مدیریت پنل‌ها", callback_data="manage_panels")],
+        [InlineKeyboardButton("🖥 مدیریت سرورها", callback_data="manage_servers")],
         [InlineKeyboardButton("🔀 مدیریت پورت و کانفیگ", callback_data="start_merge")],
         [InlineKeyboardButton("🗂 مدیریت بکاپ", callback_data="backup_menu")],
         [InlineKeyboardButton("👤 پروفایل", callback_data="profile")],
@@ -268,22 +286,35 @@ def kb_main() -> InlineKeyboardMarkup:
 def kb_back_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ بازگشت", callback_data="back_main")]])
 
-def kb_panels(store: Dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
+def kb_yes_no(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تایید", callback_data=f"{prefix}:yes"),
+         InlineKeyboardButton("❌ خیر", callback_data=f"{prefix}:no")],
+    ])
+
+def kb_http_https() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔒 HTTP", callback_data="panel_scheme:http"),
+         InlineKeyboardButton("🔐 HTTPS", callback_data="panel_scheme:https")],
+    ])
+
+def kb_servers(store: Dict[str, Any], user_id: int) -> InlineKeyboardMarkup:
     bucket = get_user_bucket(store, user_id)
-    rows = [[InlineKeyboardButton("➕ اضافه کردن پنل", callback_data="add_panel")]]
-    for pid in bucket.get("order", []):
-        rows.append([
-            InlineKeyboardButton(f"📌 {pid}", callback_data=f"panel:{pid}"),
-            InlineKeyboardButton("✏️ ویرایش", callback_data=f"edit:{pid}"),
-            InlineKeyboardButton("🗑 حذف", callback_data=f"del:{pid}")
-        ])
+    rows = [[InlineKeyboardButton("➕ افزودن سرور جدید", callback_data="add_server")]]
+    for sid in bucket.get("order", []):
+        s = bucket["servers"].get(sid, {})
+        ip = s.get("ip", sid)
+        dom = (s.get("panel") or {}).get("domain")
+        title = f"🌐 {ip}" + (f" ({dom})" if dom else "")
+        rows.append([InlineKeyboardButton(title, callback_data=f"server:{sid}")])
     rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_main")])
     return InlineKeyboardMarkup(rows)
 
-def kb_panel_actions(pid: str) -> InlineKeyboardMarkup:
+def kb_server_actions(sid: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔀 ادغام کلاینت/پورت‌ها", callback_data=f"merge:{pid}")],
-        [InlineKeyboardButton("⬅️ بازگشت", callback_data="manage_panels")]
+        [InlineKeyboardButton("✏️ ویرایش اطلاعات", callback_data=f"edit_server:{sid}")],
+        [InlineKeyboardButton("🗑 حذف سرور", callback_data=f"del_server:{sid}")],
+        [InlineKeyboardButton("⬅️ بازگشت", callback_data="manage_servers")],
     ])
 
 def kb_backup_menu() -> InlineKeyboardMarkup:
@@ -295,10 +326,34 @@ def kb_backup_menu() -> InlineKeyboardMarkup:
 
 def kb_backup_import_mode() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔁 از سرورهای موجود", callback_data="bk_import_existing")],
+        [InlineKeyboardButton("🔁 از سرورهای ذخیره‌شده", callback_data="bk_import_existing")],
         [InlineKeyboardButton("➕ سرور جدید (بدون ذخیره)", callback_data="bk_import_new")],
         [InlineKeyboardButton("⬅️ بازگشت", callback_data="backup_menu")],
     ])
+
+def kb_edit_menu(sid: str, has_panel: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📝 ویرایش IPv4", callback_data=f"edit_field:{sid}:ip")],
+        [InlineKeyboardButton("🧑‍💻 ویرایش SSH User", callback_data=f"edit_field:{sid}:ssh_user")],
+        [InlineKeyboardButton("🔑 ویرایش SSH Pass", callback_data=f"edit_field:{sid}:ssh_pass")],
+        [InlineKeyboardButton("🔢 ویرایش SSH Port", callback_data=f"edit_field:{sid}:ssh_port")],
+    ]
+    if has_panel:
+        rows += [
+            [InlineKeyboardButton("🌍 ویرایش دامنه پنل", callback_data=f"edit_field:{sid}:panel_domain")],
+            [InlineKeyboardButton("🔒 تغییر HTTP/HTTPS", callback_data=f"edit_field:{sid}:panel_scheme")],
+            [InlineKeyboardButton("🔢 ویرایش پورت پنل", callback_data=f"edit_field:{sid}:panel_port")],
+            [InlineKeyboardButton("🧭 ویرایش Path پنل", callback_data=f"edit_field:{sid}:panel_path")],
+            [InlineKeyboardButton("👤 ویرایش User پنل", callback_data=f"edit_field:{sid}:panel_user")],
+            [InlineKeyboardButton("🔑 ویرایش Pass پنل", callback_data=f"edit_field:{sid}:panel_pass")],
+            [InlineKeyboardButton("🧹 حذف پنل از سرور", callback_data=f"edit_field:{sid}:panel_remove")],
+        ]
+    else:
+        rows += [
+            [InlineKeyboardButton("➕ اضافه کردن پنل برای این سرور", callback_data=f"edit_field:{sid}:panel_add")],
+        ]
+    rows += [[InlineKeyboardButton("⬅️ بازگشت", callback_data=f"server:{sid}")]]
+    return InlineKeyboardMarkup(rows)
 
 def env_required(name: str) -> str:
     v = os.getenv(name, "").strip()
@@ -306,15 +361,145 @@ def env_required(name: str) -> str:
         raise RuntimeError(f"Missing env: {name}")
     return v
 
-# ------------------------- Start & Navigation -------------------------
+# =========================
+# UI text helpers
+# =========================
 START_TEXT = (
     "🤖 **به xui_HUB خوش آمدید**\n\n"
-    "xui_HUB یک ربات حرفه‌ای برای مدیریت پنل‌های **3x-ui / x-ui** است.\n"
-    "از داخل تلگرام می‌توانید **پنل‌ها، پورت‌ها، کانفیگ‌ها و بکاپ‌ها** را مدیریت کنید.\n\n"
-    "برای شروع، از منوی زیر استفاده کنید 👇\n\n"
+    "این ربات برای مدیریت سرورها و پنل‌های **3x-ui / x-ui** ساخته شده است.\n"
+    "از داخل تلگرام می‌توانید:\n"
+    "• سرور اضافه کنید ✅\n"
+    "• پنل را ثبت کنید 🧩\n"
+    "• پورت‌ها را از دیتابیس استخراج کنید ⚡️\n"
+    "• بکاپ و ریستور انجام دهید 🗂\n\n"
+    "از منوی زیر انتخاب کنید 👇\n\n"
     "👨‍💻 توسعه‌دهنده: @EmadHabibnia"
 )
 
+def build_server_added_message(server: Dict[str, Any]) -> str:
+    ip = server.get("ip","")
+    ssh_user = server.get("ssh_user","")
+    ssh_pass = server.get("ssh_pass","")
+    ssh_port = server.get("ssh_port", 22)
+    return (
+        "✅ **سرور شما با موفقیت اضافه شد** 🎉\n\n"
+        "اطلاعات سرور:\n"
+        f"`Ipv4: {ip}`\n"
+        f"`User: {ssh_user}`\n"
+        f"`Pass: {ssh_pass}`\n"
+        f"`portssh:{ssh_port}`\n"
+    )
+
+def build_panel_added_message(server: Dict[str, Any]) -> str:
+    panel = server.get("panel") or {}
+    domain = panel.get("domain") or server.get("ip","")
+    scheme = panel.get("scheme","http")
+    port = panel.get("port","")
+    path = panel.get("path","/")
+    url = f"{scheme}://{domain}:{port}{path}"
+    return (
+        "\n✅ **پنل XUI هم با موفقیت ثبت شد** 🧩\n\n"
+        "اطلاعات پنل:\n"
+        f"`Xui: {url}`\n"
+        f"`User: {panel.get('user','')}`\n"
+        f"`Pass: {panel.get('pass','')}`\n"
+    )
+
+def build_server_details_text(server: Dict[str, Any], ports: Optional[List[int]]) -> str:
+    ip = server.get("ip","")
+    ssh_user = server.get("ssh_user","")
+    ssh_pass = server.get("ssh_pass","")
+    ssh_port = server.get("ssh_port", 22)
+
+    panel = server.get("panel") or {}
+    domain = panel.get("domain","")
+    scheme = panel.get("scheme","http")
+    pport = panel.get("port")
+    ppath = panel.get("path","/")
+    puser = panel.get("user","")
+    ppass = panel.get("pass","")
+
+    parts = []
+    parts.append("🖥 **اطلاعات سرور**")
+    parts.append(f"`Ipv4: {ip}`")
+    parts.append(f"`User: {ssh_user}`")
+    parts.append(f"`Pass: {ssh_pass}`")
+    parts.append(f"`portssh:{ssh_port}`")
+    parts.append("")
+
+    if domain:
+        parts.append("🌍 **Paneldomin:**")
+        parts.append(f"`{domain}`")
+        parts.append("")
+
+    if pport:
+        url = f"{scheme}://{domain or ip}:{pport}{ppath}"
+        parts.append("🧩 **اطلاعات پنل XUI**")
+        parts.append(f"`Xui: {url}`")
+        parts.append(f"`User: {puser}`")
+        parts.append(f"`Pass: {ppass}`")
+        parts.append("")
+        parts.append(f"`Port panel: {pport}`")
+        parts.append("")
+
+    if ports is None:
+        parts.append("⚠️ **Port ها**")
+        parts.append("`خطا در دریافت پورت‌ها (ممکن است sudo/sqlite3 در دسترس نباشد یا دیتابیس پیدا نشد)`")
+    else:
+        parts.append("⚡️ **Port ها:**")
+        if ports:
+            for x in ports:
+                parts.append(f"`{x}`")
+            parts.append("")
+            parts.append("📌 لیست یک‌خطی:")
+            parts.append(f"`{','.join(str(x) for x in ports)}`")
+        else:
+            parts.append("`هیچ پورتی پیدا نشد.`")
+
+    return "\n".join(parts)
+
+# =========================
+# DB access helpers
+# =========================
+async def find_db_path(server: Dict[str, Any]) -> Optional[str]:
+    code, out, err = await asyncio.to_thread(
+        ssh_exec,
+        server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
+        FIND_DB_CMD
+    )
+    db_path = out.strip().splitlines()[-1] if out.strip() else ""
+    if "NOT_FOUND" in db_path or not db_path:
+        return None
+    return db_path
+
+async def restart_xui(server: Dict[str, Any]) -> None:
+    await asyncio.to_thread(
+        ssh_exec,
+        server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
+        "sudo x-ui restart || sudo systemctl restart x-ui || true"
+    )
+
+async def get_inbound_ports(server: Dict[str, Any]) -> Optional[List[int]]:
+    db_path = await find_db_path(server)
+    if not db_path:
+        return None
+    code, out, err = await asyncio.to_thread(
+        ssh_exec,
+        server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
+        list_inbound_ports_cmd(db_path)
+    )
+    if code != 0:
+        return None
+    ports: List[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            ports.append(int(line))
+    return ports
+
+# =========================
+# Start & Navigation
+# =========================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(START_TEXT, reply_markup=kb_main(), parse_mode="Markdown")
 
@@ -330,24 +515,28 @@ async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(START_TEXT, reply_markup=kb_main(), parse_mode="Markdown")
         return
 
-    if q.data == "manage_panels":
+    if q.data == "manage_servers":
         await q.edit_message_text(
-            "🛠 **مدیریت پنل‌ها**\n\nاز این بخش می‌توانید پنل‌ها را اضافه/ویرایش/حذف کنید.",
-            reply_markup=kb_panels(store, user_id),
+            "🖥 **مدیریت سرورها**\n\n"
+            "از این بخش می‌توانید سرورها را اضافه کنید و اطلاعات آن‌ها را ببینید/ویرایش/حذف کنید.",
+            reply_markup=kb_servers(store, user_id),
             parse_mode="Markdown"
         )
         return
 
     if q.data == "start_merge":
         if not bucket["order"]:
-            await q.edit_message_text("ابتدا یک پنل اضافه کنید.", reply_markup=kb_panels(store, user_id))
+            await q.edit_message_text("ابتدا یک سرور اضافه کنید.", reply_markup=kb_servers(store, user_id))
             return
         rows = []
-        for pid in bucket["order"]:
-            rows.append([InlineKeyboardButton(f"🔀 {pid}", callback_data=f"merge:{pid}")])
+        for sid in bucket["order"]:
+            s = bucket["servers"].get(sid, {})
+            ip = s.get("ip", sid)
+            rows.append([InlineKeyboardButton(f"🔀 {ip}", callback_data=f"merge:{sid}")])
         rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_main")])
         await q.edit_message_text(
-            "🔀 **مدیریت پورت و کانفیگ**\n\nپنلی که می‌خواهید عملیات روی آن انجام شود را انتخاب کنید:",
+            "🔀 **مدیریت پورت و کانفیگ**\n\n"
+            "سروری که می‌خواهید عملیات ادغام روی آن انجام شود را انتخاب کنید:",
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode="Markdown"
         )
@@ -356,214 +545,516 @@ async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "profile":
         u = update.effective_user
         username = f"@{u.username}" if u.username else "ندارد"
-        panels_count = len(bucket.get("order", []))
-        panel_list = "\n".join([f"• {p}" for p in bucket.get("order", [])]) if panels_count else "—"
+        servers_count = len(bucket.get("order", []))
+        server_list = "\n".join([f"• {bucket['servers'][sid].get('ip', sid)}" for sid in bucket.get("order", [])]) if servers_count else "—"
         text = (
             "👤 **پروفایل شما**\n\n"
             f"نام: {u.full_name}\n"
             f"یوزرنیم: {username}\n"
             f"User ID: {u.id}\n\n"
-            f"تعداد پنل‌ها: {panels_count}\n"
-            f"لیست پنل‌ها:\n{panel_list}"
+            f"تعداد سرورها: {servers_count}\n"
+            f"لیست سرورها:\n{server_list}"
         )
         await q.edit_message_text(text, reply_markup=kb_back_main(), parse_mode="Markdown")
         return
 
-    if q.data.startswith("panel:"):
-        pid = q.data.split(":", 1)[1]
-        if pid not in bucket["panels"]:
-            await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
+    if q.data.startswith("server:"):
+        sid = q.data.split(":", 1)[1]
+        s = bucket["servers"].get(sid)
+        if not s:
+            await q.edit_message_text("سرور پیدا نشد.", reply_markup=kb_servers(store, user_id))
             return
-        context.user_data.clear()
-        context.user_data["selected_pid"] = pid
-        await q.edit_message_text(f"📌 پنل انتخاب شد: **{pid}**", reply_markup=kb_panel_actions(pid), parse_mode="Markdown")
+
+        await q.edit_message_text("⏳ در حال استخراج پورت‌ها از سرور...")
+
+        ports = await get_inbound_ports({
+            "ssh_host": s["ssh_host"],
+            "ssh_port": s["ssh_port"],
+            "ssh_user": s["ssh_user"],
+            "ssh_pass": s["ssh_pass"],
+        })
+
+        text = build_server_details_text(s, ports)
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=kb_server_actions(sid))
         return
 
-    if q.data.startswith("del:"):
-        pid = q.data.split(":", 1)[1]
-        if pid in bucket["panels"]:
-            del bucket["panels"][pid]
-            bucket["order"] = [x for x in bucket["order"] if x != pid]
+    if q.data.startswith("del_server:"):
+        sid = q.data.split(":", 1)[1]
+        if sid in bucket["servers"]:
+            del bucket["servers"][sid]
+            bucket["order"] = [x for x in bucket["order"] if x != sid]
             save_store(store)
-        await q.edit_message_text("✅ پنل حذف شد.", reply_markup=kb_panels(store, user_id))
+        await q.edit_message_text("✅ سرور حذف شد.", reply_markup=kb_servers(store, user_id))
         return
 
-    if q.data.startswith("edit:"):
-        pid = q.data.split(":", 1)[1]
-        if pid not in bucket["panels"]:
-            await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
+    if q.data.startswith("edit_server:"):
+        sid = q.data.split(":", 1)[1]
+        s = bucket["servers"].get(sid)
+        if not s:
+            await q.edit_message_text("سرور پیدا نشد.", reply_markup=kb_servers(store, user_id))
             return
+
         context.user_data.clear()
-        context.user_data["edit_pid"] = pid
+        context.user_data["edit_sid"] = sid
+
+        ports = await get_inbound_ports({
+            "ssh_host": s["ssh_host"],
+            "ssh_port": s["ssh_port"],
+            "ssh_user": s["ssh_user"],
+            "ssh_pass": s["ssh_pass"],
+        })
+
+        text = (
+            "✏️ **ویرایش اطلاعات سرور**\n\n"
+            "📌 وضعیت فعلی:\n"
+            f"{build_server_details_text(s, ports)}\n\n"
+            "حالا یکی از گزینه‌های ویرایش را انتخاب کنید 👇"
+        )
         await q.edit_message_text(
-            "✏️ **ویرایش پنل**\n\n"
-            "به این شکل ارسال کنید:\n"
-            "`field=value`\n\n"
-            "فیلدها:\n"
-            "panel_host, panel_scheme(http/https), panel_port, panel_path,\n"
-            "panel_user, panel_pass, ssh_host, ssh_user, ssh_port, ssh_pass\n\n"
-            "مثال:\n"
-            "`ssh_port=22`",
-            parse_mode="Markdown"
+            text,
+            parse_mode="Markdown",
+            reply_markup=kb_edit_menu(sid, has_panel=bool(s.get("panel")))
         )
         return
 
-# ------------------------- Add panel flow -------------------------
-async def add_panel_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # if none matched, ignore
+    return
+
+# =========================
+# Add Server Flow (with optional panel)
+# =========================
+async def add_server_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+
     context.user_data.clear()
+    context.user_data["new_server"] = {}
+
     await q.edit_message_text(
-        "🛠 **افزودن پنل جدید**\n\nلطفاً **آیپی یا دامنه پنل** را ارسال کنید:",
+        "➕ **افزودن سرور جدید** 🖥\n\n"
+        "لطفاً **IPv4** سرور را ارسال کنید:\n"
+        "مثال:\n"
+        "`159.65.243.137`",
         parse_mode="Markdown"
     )
-    return ADD_IP
+    return SV_IP
 
-async def add_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_panel"] = {"panel_host": update.message.text.strip()}
-    await update.message.reply_text("🔒 نوع دسترسی پنل: `HTTP` یا `HTTPS`", parse_mode="Markdown")
-    return ADD_HTTP
+async def sv_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ip = update.message.text.strip()
+    context.user_data["new_server"]["ip"] = ip
 
-async def add_http(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    v = update.message.text.strip().lower()
-    if v not in ("http", "https"):
-        await update.message.reply_text("فقط `HTTP` یا `HTTPS` ارسال کنید.", parse_mode="Markdown")
-        return ADD_HTTP
-    context.user_data["new_panel"]["panel_scheme"] = v
-    await update.message.reply_text("🔢 پورت پنل را ارسال کنید:")
-    return ADD_PANEL_PORT
+    await update.message.reply_text(
+        "👤 **یوزرنیم SSH** را ارسال کنید.\n\n"
+        "اگر یوزرنیم شما **root** است، دستور زیر را بزنید:\n"
+        "`/skip`",
+        parse_mode="Markdown"
+    )
+    return SV_SSH_USER
 
-async def add_panel_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sv_ssh_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    if txt == "/skip":
+        context.user_data["new_server"]["ssh_user"] = "root"
+    else:
+        context.user_data["new_server"]["ssh_user"] = txt
+
+    await update.message.reply_text(
+        "🔑 **پسورد SSH** را ارسال کنید:",
+        parse_mode="Markdown"
+    )
+    return SV_SSH_PASS
+
+async def sv_ssh_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_server"]["ssh_pass"] = update.message.text.strip()
+
+    await update.message.reply_text(
+        "🔢 **پورت SSH** را ارسال کنید.\n\n"
+        "اگر پورت شما **22** است، دستور زیر را بزنید:\n"
+        "`/skip`",
+        parse_mode="Markdown"
+    )
+    return SV_SSH_PORT
+
+async def sv_ssh_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    if txt == "/skip":
+        context.user_data["new_server"]["ssh_port"] = 22
+    else:
+        try:
+            p = int(txt)
+            if not (1 <= p <= 65535):
+                raise ValueError()
+            context.user_data["new_server"]["ssh_port"] = p
+        except:
+            await update.message.reply_text("پورت معتبر ارسال کنید (1..65535) یا `/skip`.", parse_mode="Markdown")
+            return SV_SSH_PORT
+
+    await update.message.reply_text(
+        "🧩 آیا می‌خواهید برای این سرور **پنل XUI** هم اضافه کنید؟",
+        reply_markup=kb_yes_no("sv_add_panel"),
+        parse_mode="Markdown"
+    )
+    return SV_ASK_ADD_PANEL
+
+async def sv_ask_add_panel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    choice = q.data.split(":", 1)[1]
+
+    if choice == "no":
+        store = load_store()
+        bucket = get_user_bucket(store, update.effective_user.id)
+
+        s = context.user_data.get("new_server", {})
+        ip = s.get("ip","")
+        sid = safe_server_id(ip)
+        base = sid
+        i = 2
+        while sid in bucket["servers"]:
+            sid = f"{base}_{i}"
+            i += 1
+
+        server_obj = {
+            "ip": s["ip"],
+            "ssh_host": s["ip"],
+            "ssh_user": s["ssh_user"],
+            "ssh_pass": s["ssh_pass"],
+            "ssh_port": s["ssh_port"],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "panel": None,
+        }
+        bucket["servers"][sid] = server_obj
+        bucket["order"].append(sid)
+        save_store(store)
+        context.user_data.clear()
+
+        await q.edit_message_text(
+            build_server_added_message(server_obj) + "\n\n"
+            "از منوی اصلی می‌توانید ادامه بدهید 👇",
+            parse_mode="Markdown",
+            reply_markup=kb_main()
+        )
+        return ConversationHandler.END
+
+    # yes -> ask domain
+    await q.edit_message_text(
+        "🌍 **دامنه پنل** را ارسال کنید.\n\n"
+        "اگر دامنه ندارید، دستور زیر را بزنید تا همان IP استفاده شود:\n"
+        "`/skip`",
+        parse_mode="Markdown"
+    )
+    return SV_PANEL_DOMAIN
+
+async def sv_panel_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    ip = context.user_data["new_server"]["ip"]
+    domain = ip if txt == "/skip" else txt
+    context.user_data["new_server"]["panel"] = {"domain": domain}
+
+    await update.message.reply_text(
+        "🔒 **نوع دسترسی پنل** را انتخاب کنید:",
+        reply_markup=kb_http_https()
+    )
+    return SV_PANEL_SCHEME
+
+async def sv_panel_scheme_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    scheme = q.data.split(":", 1)[1]
+    context.user_data["new_server"]["panel"]["scheme"] = scheme
+    await q.edit_message_text(
+        "🔢 **پورت پنل** را ارسال کنید:\n"
+        "مثال:\n"
+        "`8184`",
+        parse_mode="Markdown"
+    )
+    return SV_PANEL_PORT
+
+async def sv_panel_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        port = int(update.message.text.strip())
-        if not (1 <= port <= 65535):
+        p = int(update.message.text.strip())
+        if not (1 <= p <= 65535):
             raise ValueError()
     except:
         await update.message.reply_text("پورت معتبر ارسال کنید (1..65535).")
-        return ADD_PANEL_PORT
-    context.user_data["new_panel"]["panel_port"] = port
-    await update.message.reply_text("🧭 پچ پنل (مثلاً `/panel`) — اگر ندارید `/`:")
-    return ADD_PATH
+        return SV_PANEL_PORT
 
-async def add_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_server"]["panel"]["port"] = p
+    await update.message.reply_text(
+        "🧭 **Path پنل** را ارسال کنید.\n\n"
+        "مثال:\n"
+        "`/tracklessvpn/`\n"
+        "یا اگر ندارید:\n"
+        "`/`",
+        parse_mode="Markdown"
+    )
+    return SV_PANEL_PATH
+
+async def sv_panel_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = update.message.text.strip()
     if not path.startswith("/"):
         path = "/" + path
-    context.user_data["new_panel"]["panel_path"] = path
-    await update.message.reply_text("👤 یوزرنیم پنل:")
-    return ADD_USER
+    context.user_data["new_server"]["panel"]["path"] = path
+    await update.message.reply_text("👤 **یوزرنیم پنل** را ارسال کنید:", parse_mode="Markdown")
+    return SV_PANEL_USER
 
-async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_panel"]["panel_user"] = update.message.text.strip()
-    await update.message.reply_text("🔑 پسورد پنل:")
-    return ADD_PASS
+async def sv_panel_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_server"]["panel"]["user"] = update.message.text.strip()
+    await update.message.reply_text("🔑 **پسورد پنل** را ارسال کنید:", parse_mode="Markdown")
+    return SV_PANEL_PASS
 
-async def add_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_panel"]["panel_pass"] = update.message.text.strip()
-    await update.message.reply_text("🌐 SSH Host (آیپی/دامنه سرور):")
-    return ADD_SSH_HOST
-
-async def add_ssh_host(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_panel"]["ssh_host"] = update.message.text.strip()
-    await update.message.reply_text("👤 SSH Username:")
-    return ADD_SSH_USER
-
-async def add_ssh_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_panel"]["ssh_user"] = update.message.text.strip()
-    await update.message.reply_text("🔢 SSH Port (مثلاً 22):")
-    return ADD_SSH_PORT
-
-async def add_ssh_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        port = int(update.message.text.strip())
-        if not (1 <= port <= 65535):
-            raise ValueError()
-    except:
-        await update.message.reply_text("پورت معتبر ارسال کنید (1..65535).")
-        return ADD_SSH_PORT
-    context.user_data["new_panel"]["ssh_port"] = port
-    await update.message.reply_text("🔑 SSH Password:")
-    return ADD_SSH_PASS
-
-async def add_ssh_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_panel"]["ssh_pass"] = update.message.text.strip()
-
-    store = load_store()
-    user_id = update.effective_user.id
-    bucket = get_user_bucket(store, user_id)
-
-    host = context.user_data["new_panel"]["panel_host"]
-    pid = safe_panel_id(host)
-    base = pid
-    i = 2
-    while pid in bucket["panels"]:
-        pid = f"{base}_{i}"
-        i += 1
-
-    bucket["panels"][pid] = context.user_data["new_panel"]
-    bucket["order"].append(pid)
-    save_store(store)
-
-    context.user_data.clear()
-    await update.message.reply_text("✅ پنل ذخیره شد.", reply_markup=kb_main())
-    return ConversationHandler.END
-
-# ------------------------- Edit flow (field=value) -------------------------
-async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pid = context.user_data.get("edit_pid")
-    if not pid:
-        return ConversationHandler.END
-
-    text = update.message.text.strip()
-    if "=" not in text:
-        await update.message.reply_text("فرمت صحیح: `field=value`", parse_mode="Markdown")
-        return EDIT_VALUE
-
-    key, val = text.split("=", 1)
-    key = key.strip()
-    val = val.strip()
-
-    allowed = {"panel_host","panel_scheme","panel_port","panel_path","panel_user","panel_pass","ssh_host","ssh_user","ssh_port","ssh_pass"}
-    if key not in allowed:
-        await update.message.reply_text("نام فیلد اشتباه است. دوباره ارسال کنید.")
-        return EDIT_VALUE
-
-    if key in ("panel_port","ssh_port"):
-        try:
-            v = int(val)
-            if not (1 <= v <= 65535):
-                raise ValueError()
-            val = v
-        except:
-            await update.message.reply_text("پورت معتبر ارسال کنید (1..65535).")
-            return EDIT_VALUE
-
-    if key == "panel_scheme":
-        v = val.lower()
-        if v not in ("http","https"):
-            await update.message.reply_text("فقط `http` یا `https`", parse_mode="Markdown")
-            return EDIT_VALUE
-        val = v
-
-    if key == "panel_path":
-        if not val.startswith("/"):
-            val = "/" + val
+async def sv_panel_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_server"]["panel"]["pass"] = update.message.text.strip()
 
     store = load_store()
     bucket = get_user_bucket(store, update.effective_user.id)
-    if pid not in bucket["panels"]:
-        context.user_data.clear()
-        await update.message.reply_text("پنل پیدا نشد.", reply_markup=kb_main())
-        return ConversationHandler.END
 
-    bucket["panels"][pid][key] = val
+    s = context.user_data["new_server"]
+    ip = s.get("ip","")
+    sid = safe_server_id(ip)
+    base = sid
+    i = 2
+    while sid in bucket["servers"]:
+        sid = f"{base}_{i}"
+        i += 1
+
+    server_obj = {
+        "ip": s["ip"],
+        "ssh_host": s["ip"],
+        "ssh_user": s["ssh_user"],
+        "ssh_pass": s["ssh_pass"],
+        "ssh_port": s["ssh_port"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "panel": s["panel"],
+    }
+    bucket["servers"][sid] = server_obj
+    bucket["order"].append(sid)
     save_store(store)
 
     context.user_data.clear()
-    await update.message.reply_text("✅ ویرایش انجام شد.", reply_markup=kb_main())
+
+    text = build_server_added_message(server_obj) + build_panel_added_message(server_obj) + "\n\n"
+    text += "از منوی اصلی می‌توانید ادامه بدهید 👇"
+
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ------------------------- Merge flow -------------------------
+# =========================
+# Edit Server Flow (button based)
+# =========================
+async def edit_router_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    store = load_store()
+    bucket = get_user_bucket(store, update.effective_user.id)
+
+    if not q.data.startswith("edit_field:"):
+        return ConversationHandler.END
+
+    _, sid, field = q.data.split(":", 2)
+    s = bucket["servers"].get(sid)
+    if not s:
+        await q.edit_message_text("سرور پیدا نشد.", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    # actions that don't require input
+    if field == "panel_remove":
+        s["panel"] = None
+        save_store(store)
+        ports = await get_inbound_ports({
+            "ssh_host": s["ssh_host"],
+            "ssh_port": s["ssh_port"],
+            "ssh_user": s["ssh_user"],
+            "ssh_pass": s["ssh_pass"],
+        })
+        await q.edit_message_text(
+            "✅ پنل از سرور حذف شد.\n\n"
+            f"{build_server_details_text(s, ports)}\n\n"
+            "حالا اگر خواستید، می‌توانید دوباره پنل اضافه کنید یا سایر فیلدها را تغییر دهید 👇",
+            parse_mode="Markdown",
+            reply_markup=kb_edit_menu(sid, has_panel=False)
+        )
+        return EDIT_MENU
+
+    if field == "panel_add":
+        # create empty panel and ask for domain first
+        context.user_data["edit_sid"] = sid
+        context.user_data["edit_field"] = "panel_domain"
+        await q.edit_message_text(
+            "➕ **افزودن پنل برای این سرور** 🧩\n\n"
+            "🌍 دامنه پنل را ارسال کنید.\n"
+            "اگر دامنه ندارید، `/skip` بزنید تا همان IP استفاده شود.",
+            parse_mode="Markdown"
+        )
+        return EDIT_INPUT
+
+    if field == "panel_scheme":
+        # scheme choice via buttons
+        context.user_data["edit_sid"] = sid
+        context.user_data["edit_field"] = "panel_scheme"
+        await q.edit_message_text(
+            "🔒 نوع دسترسی پنل را انتخاب کنید:",
+            reply_markup=kb_http_https()
+        )
+        return EDIT_MENU
+
+    # input-required fields
+    context.user_data["edit_sid"] = sid
+    context.user_data["edit_field"] = field
+
+    prompts = {
+        "ip": "📝 **ویرایش IPv4**\n\nلطفاً IP جدید را ارسال کنید:\nمثال: `159.65.243.137`",
+        "ssh_user": "🧑‍💻 **ویرایش SSH User**\n\nیوزرنیم جدید را ارسال کنید.\nاگر root است: `/skip`",
+        "ssh_pass": "🔑 **ویرایش SSH Pass**\n\nپسورد جدید را ارسال کنید:",
+        "ssh_port": "🔢 **ویرایش SSH Port**\n\nپورت جدید را ارسال کنید.\nاگر 22 است: `/skip`",
+        "panel_domain": "🌍 **ویرایش دامنه پنل**\n\nدامنه جدید را ارسال کنید.\nاگر ندارید: `/skip` (یعنی همان IP)",
+        "panel_port": "🔢 **ویرایش پورت پنل**\n\nپورت جدید را ارسال کنید:",
+        "panel_path": "🧭 **ویرایش Path پنل**\n\nPath جدید را ارسال کنید (مثلاً `/tracklessvpn/` یا `/`):",
+        "panel_user": "👤 **ویرایش User پنل**\n\nیوزرنیم جدید پنل را ارسال کنید:",
+        "panel_pass": "🔑 **ویرایش Pass پنل**\n\nپسورد جدید پنل را ارسال کنید:",
+    }
+    await q.edit_message_text(prompts.get(field, "لطفاً مقدار جدید را ارسال کنید:"), parse_mode="Markdown")
+    return EDIT_INPUT
+
+async def edit_input_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    store = load_store()
+    bucket = get_user_bucket(store, update.effective_user.id)
+
+    sid = context.user_data.get("edit_sid")
+    field = context.user_data.get("edit_field")
+
+    if not sid or not field:
+        await update.message.reply_text("❌ جلسه ویرایش معتبر نیست.", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    s = bucket["servers"].get(sid)
+    if not s:
+        await update.message.reply_text("❌ سرور پیدا نشد.", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    txt = update.message.text.strip()
+
+    # ensure panel object if needed
+    def ensure_panel():
+        if not s.get("panel"):
+            s["panel"] = {
+                "domain": s.get("ip",""),
+                "scheme": "http",
+                "port": 0,
+                "path": "/",
+                "user": "",
+                "pass": "",
+            }
+
+    try:
+        if field == "ip":
+            s["ip"] = txt
+            s["ssh_host"] = txt  # host follows ip
+        elif field == "ssh_user":
+            s["ssh_user"] = "root" if txt == "/skip" else txt
+        elif field == "ssh_pass":
+            s["ssh_pass"] = txt
+        elif field == "ssh_port":
+            s["ssh_port"] = 22 if txt == "/skip" else int(txt)
+            if not (1 <= int(s["ssh_port"]) <= 65535):
+                raise ValueError()
+        elif field == "panel_domain":
+            ensure_panel()
+            s["panel"]["domain"] = s.get("ip","") if txt == "/skip" else txt
+        elif field == "panel_port":
+            ensure_panel()
+            p = int(txt)
+            if not (1 <= p <= 65535):
+                raise ValueError()
+            s["panel"]["port"] = p
+        elif field == "panel_path":
+            ensure_panel()
+            path = txt
+            if not path.startswith("/"):
+                path = "/" + path
+            s["panel"]["path"] = path
+        elif field == "panel_user":
+            ensure_panel()
+            s["panel"]["user"] = txt
+        elif field == "panel_pass":
+            ensure_panel()
+            s["panel"]["pass"] = txt
+        else:
+            await update.message.reply_text("فیلد ناشناخته است.", reply_markup=kb_main())
+            return ConversationHandler.END
+
+        save_store(store)
+
+        # show updated details at top + edit menu again
+        ports = await get_inbound_ports({
+            "ssh_host": s["ssh_host"],
+            "ssh_port": s["ssh_port"],
+            "ssh_user": s["ssh_user"],
+            "ssh_pass": s["ssh_pass"],
+        })
+
+        context.user_data["edit_field"] = None
+
+        await update.message.reply_text(
+            "✅ **ویرایش با موفقیت انجام شد**\n\n"
+            f"{build_server_details_text(s, ports)}\n\n"
+            "اگر باز هم نیاز به ویرایش دارید، از منوی زیر انتخاب کنید 👇",
+            parse_mode="Markdown",
+            reply_markup=kb_edit_menu(sid, has_panel=bool(s.get("panel")))
+        )
+        return EDIT_MENU
+
+    except:
+        await update.message.reply_text("❌ مقدار معتبر نیست. دوباره ارسال کنید.")
+        return EDIT_INPUT
+
+async def edit_scheme_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    if not q.data.startswith("panel_scheme:"):
+        return EDIT_MENU
+
+    scheme = q.data.split(":", 1)[1]
+    store = load_store()
+    bucket = get_user_bucket(store, update.effective_user.id)
+
+    sid = context.user_data.get("edit_sid")
+    if not sid:
+        await q.edit_message_text("❌ جلسه ویرایش معتبر نیست.", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    s = bucket["servers"].get(sid)
+    if not s:
+        await q.edit_message_text("❌ سرور پیدا نشد.", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    if not s.get("panel"):
+        s["panel"] = {"domain": s.get("ip",""), "scheme": "http", "port": 0, "path": "/", "user": "", "pass": ""}
+
+    s["panel"]["scheme"] = scheme
+    save_store(store)
+
+    ports = await get_inbound_ports({
+        "ssh_host": s["ssh_host"],
+        "ssh_port": s["ssh_port"],
+        "ssh_user": s["ssh_user"],
+        "ssh_pass": s["ssh_pass"],
+    })
+
+    await q.edit_message_text(
+        "✅ نوع دسترسی پنل تغییر کرد.\n\n"
+        f"{build_server_details_text(s, ports)}\n\n"
+        "حالا می‌توانید بقیه گزینه‌ها را هم ویرایش کنید 👇",
+        parse_mode="Markdown",
+        reply_markup=kb_edit_menu(sid, has_panel=True)
+    )
+    return EDIT_MENU
+
+# =========================
+# Merge flow (unchanged logic, now selects server)
+# =========================
 async def merge_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -572,13 +1063,14 @@ async def merge_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
 
-    pid = q.data.split(":", 1)[1]
-    if pid not in bucket["panels"]:
-        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_panels(store, user_id))
+    sid = q.data.split(":", 1)[1]
+    if sid not in bucket["servers"]:
+        await q.edit_message_text("سرور پیدا نشد.", reply_markup=kb_servers(store, user_id))
         return ConversationHandler.END
 
     context.user_data.clear()
-    context.user_data["merge"] = {"panel_id": pid, "ports": []}
+    context.user_data["merge"] = {"server_id": sid, "ports": []}
+
     await q.edit_message_text(
         "🔀 **ادغام پورت‌ها**\n\n"
         "⚠️ پورت مقصد را **از قبل** داخل پنل ساخته باشید.\n\n"
@@ -649,11 +1141,11 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
 
-    pid = context.user_data["merge"]["panel_id"]
-    panel = bucket["panels"].get(pid)
-    if not panel:
+    sid = context.user_data["merge"]["server_id"]
+    server = bucket["servers"].get(sid)
+    if not server:
         context.user_data.clear()
-        await update.message.reply_text("❌ پنل پیدا نشد.", reply_markup=kb_main())
+        await update.message.reply_text("❌ سرور پیدا نشد.", reply_markup=kb_main())
         return ConversationHandler.END
 
     src_ports = context.user_data["merge"]["ports"]
@@ -663,7 +1155,7 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code, out, err = await asyncio.to_thread(
         ssh_exec,
-        panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
+        server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
         FIND_DB_CMD
     )
     db_path = out.strip().splitlines()[-1] if out.strip() else ""
@@ -673,7 +1165,7 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     def get_inbound_id(port: int) -> Optional[int]:
-        c, o, e = ssh_exec(panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
+        c, o, e = ssh_exec(server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
                           inbound_id_by_port_cmd(db_path, port))
         v = o.strip()
         return int(v) if v.isdigit() else None
@@ -713,7 +1205,7 @@ sudo $TMP "{db_path}" "{target_id}" "{src_ids_csv}"
 
     code, out, err = await asyncio.to_thread(
         ssh_exec,
-        panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
+        server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
         remote_cmd
     )
     if code != 0:
@@ -722,18 +1214,21 @@ sudo $TMP "{db_path}" "{target_id}" "{src_ids_csv}"
         await update.message.reply_text(f"❌ خطا:\n{msg[:3500]}", reply_markup=kb_main())
         return ConversationHandler.END
 
-    await asyncio.to_thread(
-        ssh_exec,
-        panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
-        "sudo x-ui restart || sudo systemctl restart x-ui || true"
-    )
+    await restart_xui({
+        "ssh_host": server["ssh_host"],
+        "ssh_port": server["ssh_port"],
+        "ssh_user": server["ssh_user"],
+        "ssh_pass": server["ssh_pass"],
+    })
 
     context.user_data.clear()
     await update.message.reply_text(f"✅ ادغام انجام شد.\n{out.strip()}", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ------------------------- Backup helpers -------------------------
-def build_backup_caption(panel_addr: str, now_utc: datetime) -> str:
+# =========================
+# Backup helpers + flow (same behavior, now uses servers list)
+# =========================
+def build_backup_caption(server_addr: str, now_utc: datetime) -> str:
     g_date = now_utc.strftime("%Y-%m-%d")
     g_time = now_utc.strftime("%H:%M UTC")
 
@@ -743,7 +1238,7 @@ def build_backup_caption(panel_addr: str, now_utc: datetime) -> str:
     j_time = tehran.strftime("%H:%M")
 
     return (
-        f"🗂 بکاپ پنل: {panel_addr}\n\n"
+        f"🗂 بکاپ سرور: {server_addr}\n\n"
         f"📅 تاریخ (میلادی): {g_date}\n"
         f"⏰ ساعت: {g_time}\n\n"
         f"📆 تاریخ (شمسی): {to_fa_digits(j_date)}\n"
@@ -753,25 +1248,6 @@ def build_backup_caption(panel_addr: str, now_utc: datetime) -> str:
         f"👨‍💻 Developer: @EmadHabibnia"
     )
 
-async def find_db_path(panel: Dict[str, Any]) -> Optional[str]:
-    code, out, err = await asyncio.to_thread(
-        ssh_exec,
-        panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
-        FIND_DB_CMD
-    )
-    db_path = out.strip().splitlines()[-1] if out.strip() else ""
-    if "NOT_FOUND" in db_path or not db_path:
-        return None
-    return db_path
-
-async def restart_xui(panel: Dict[str, Any]) -> None:
-    await asyncio.to_thread(
-        ssh_exec,
-        panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
-        "sudo x-ui restart || sudo systemctl restart x-ui || true"
-    )
-
-# ------------------------- Backup flow -------------------------
 async def backup_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -794,34 +1270,41 @@ async def bk_export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bucket = get_user_bucket(store, user_id)
 
     if not bucket["order"]:
-        await q.edit_message_text("ابتدا یک پنل اضافه کنید.", reply_markup=kb_panels(store, user_id))
+        await q.edit_message_text("ابتدا یک سرور اضافه کنید.", reply_markup=kb_servers(store, user_id))
         return ConversationHandler.END
 
     rows = []
-    for pid in bucket["order"]:
-        rows.append([InlineKeyboardButton(f"📤 {pid}", callback_data=f"bk_export_panel:{pid}")])
+    for sid in bucket["order"]:
+        s = bucket["servers"].get(sid, {})
+        ip = s.get("ip", sid)
+        rows.append([InlineKeyboardButton(f"📤 {ip}", callback_data=f"bk_export_server:{sid}")])
     rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="backup_menu")])
 
-    await q.edit_message_text("📤 پنل موردنظر برای بکاپ را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
-    return BK_EXPORT_PICK_PANEL
+    await q.edit_message_text("📤 سرور موردنظر برای بکاپ را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
+    return BK_EXPORT_PICK_SERVER
 
-async def bk_export_pick_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bk_export_pick_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    pid = q.data.split(":", 1)[1]
+    sid = q.data.split(":", 1)[1]
     store = load_store()
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
 
-    panel = bucket["panels"].get(pid)
-    if not panel:
-        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_main())
+    server = bucket["servers"].get(sid)
+    if not server:
+        await q.edit_message_text("سرور پیدا نشد.", reply_markup=kb_main())
         return ConversationHandler.END
 
     await q.edit_message_text("⏳ در حال گرفتن بکاپ...")
 
-    db_path = await find_db_path(panel)
+    db_path = await find_db_path({
+        "ssh_host": server["ssh_host"],
+        "ssh_port": server["ssh_port"],
+        "ssh_user": server["ssh_user"],
+        "ssh_pass": server["ssh_pass"],
+    })
     if not db_path:
         await q.edit_message_text("❌ دیتابیس x-ui.db پیدا نشد یا دسترسی sudo ندارم.", reply_markup=kb_main())
         return ConversationHandler.END
@@ -838,7 +1321,7 @@ echo "{remote_tmp}"
 """
     code, out, err = await asyncio.to_thread(
         ssh_exec,
-        panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
+        server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
         remote_cmd
     )
     if code != 0:
@@ -854,7 +1337,7 @@ echo "{remote_tmp}"
             local_path = f.name
 
         def sftp_download():
-            c = ssh_client(panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"])
+            c = ssh_client(server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"])
             sftp = c.open_sftp()
             sftp.get(remote_file, local_path)
             sftp.close()
@@ -867,12 +1350,12 @@ echo "{remote_tmp}"
     finally:
         await asyncio.to_thread(
             ssh_exec,
-            panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"],
+            server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"],
             f"sudo rm -f '{remote_file}' || true"
         )
 
-    caption = build_backup_caption(panel.get("panel_host", pid), now_utc)
-    filename = f"xui_backup_{panel.get('panel_host', pid)}_{ts}.db".replace("/", "_").replace(":", "_")
+    caption = build_backup_caption(server.get("ip", sid), now_utc)
+    filename = f"xui_backup_{server.get('ip', sid)}_{ts}.db".replace("/", "_").replace(":", "_")
 
     try:
         await q.edit_message_text("✅ بکاپ آماده شد. در حال ارسال...")
@@ -910,33 +1393,35 @@ async def bk_import_existing_choose(update: Update, context: ContextTypes.DEFAUL
     bucket = get_user_bucket(store, user_id)
 
     if not bucket["order"]:
-        await q.edit_message_text("ابتدا یک پنل اضافه کنید.", reply_markup=kb_panels(store, user_id))
+        await q.edit_message_text("ابتدا یک سرور اضافه کنید.", reply_markup=kb_servers(store, user_id))
         return ConversationHandler.END
 
     context.user_data.clear()
     rows = []
-    for pid in bucket["order"]:
-        rows.append([InlineKeyboardButton(f"🔁 {pid}", callback_data=f"bk_import_panel:{pid}")])
+    for sid in bucket["order"]:
+        s = bucket["servers"].get(sid, {})
+        ip = s.get("ip", sid)
+        rows.append([InlineKeyboardButton(f"🔁 {ip}", callback_data=f"bk_import_server:{sid}")])
     rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="backup_menu")])
 
-    await q.edit_message_text("🔁 پنل مقصد برای Restore را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
-    return BK_IMPORT_PICK_PANEL
+    await q.edit_message_text("🔁 سرور مقصد برای Restore را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
+    return BK_IMPORT_PICK_SERVER
 
-async def bk_import_pick_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def bk_import_pick_server(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    pid = q.data.split(":", 1)[1]
+    sid = q.data.split(":", 1)[1]
     store = load_store()
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
 
-    panel = bucket["panels"].get(pid)
-    if not panel:
-        await q.edit_message_text("پنل پیدا نشد.", reply_markup=kb_main())
+    server = bucket["servers"].get(sid)
+    if not server:
+        await q.edit_message_text("سرور پیدا نشد.", reply_markup=kb_main())
         return ConversationHandler.END
 
-    context.user_data["bk_target_panel"] = panel
+    context.user_data["bk_target_server"] = server
     await q.edit_message_text(
         "📎 لطفاً **فایل بکاپ دیتابیس** را ارسال کنید (فایل `.db`).\n\n"
         "⚠️ این عملیات دیتابیس فعلی را جایگزین می‌کند.",
@@ -970,16 +1455,21 @@ async def bk_import_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("برای ادامه فقط `RESTORE` ارسال کنید.", parse_mode="Markdown")
         return BK_IMPORT_CONFIRM
 
-    panel = context.user_data.get("bk_target_panel")
+    server = context.user_data.get("bk_target_server")
     local_file = context.user_data.get("bk_local_file")
-    if not panel or not local_file or not os.path.exists(local_file):
+    if not server or not local_file or not os.path.exists(local_file):
         context.user_data.clear()
-        await update.message.reply_text("❌ فایل یا اطلاعات پنل موجود نیست.", reply_markup=kb_main())
+        await update.message.reply_text("❌ فایل یا اطلاعات سرور موجود نیست.", reply_markup=kb_main())
         return ConversationHandler.END
 
     await update.message.reply_text("⏳ در حال Restore بکاپ...")
 
-    db_path = await find_db_path(panel)
+    db_path = await find_db_path({
+        "ssh_host": server["ssh_host"],
+        "ssh_port": server["ssh_port"],
+        "ssh_user": server["ssh_user"],
+        "ssh_pass": server["ssh_pass"],
+    })
     if not db_path:
         try: os.remove(local_file)
         except: pass
@@ -994,7 +1484,7 @@ async def bk_import_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         def sftp_upload_and_restore():
-            c = ssh_client(panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"])
+            c = ssh_client(server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"])
             sftp = c.open_sftp()
             sftp.put(local_file, remote_upload)
             sftp.close()
@@ -1015,7 +1505,12 @@ echo "OK_RESTORE"
         if code != 0:
             raise RuntimeError((out + "\n" + err).strip()[:3500])
 
-        await restart_xui(panel)
+        await restart_xui({
+            "ssh_host": server["ssh_host"],
+            "ssh_port": server["ssh_port"],
+            "ssh_user": server["ssh_user"],
+            "ssh_pass": server["ssh_pass"],
+        })
 
         await update.message.reply_text(
             "✅ بکاپ با موفقیت بازیابی شد.\n\n"
@@ -1105,17 +1600,16 @@ async def bk_new_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ فایل بکاپ موجود نیست.", reply_markup=kb_main())
         return ConversationHandler.END
 
-    panel = {
+    server = {
         "ssh_host": ns["host"],
         "ssh_user": ns["user"],
         "ssh_port": ns["port"],
         "ssh_pass": ns["pass"],
-        "panel_host": ns["host"],
     }
 
     await update.message.reply_text("⏳ در حال Restore روی سرور جدید...")
 
-    db_path = await find_db_path(panel)
+    db_path = await find_db_path(server)
     if not db_path:
         try: os.remove(local_file)
         except: pass
@@ -1130,7 +1624,7 @@ async def bk_new_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         def sftp_upload_and_restore_new():
-            c = ssh_client(panel["ssh_host"], panel["ssh_port"], panel["ssh_user"], panel["ssh_pass"])
+            c = ssh_client(server["ssh_host"], server["ssh_port"], server["ssh_user"], server["ssh_pass"])
             sftp = c.open_sftp()
             sftp.put(local_file, remote_upload)
             sftp.close()
@@ -1151,7 +1645,7 @@ echo "OK_RESTORE"
         if code != 0:
             raise RuntimeError((out + "\n" + err).strip()[:3500])
 
-        await restart_xui(panel)
+        await restart_xui(server)
 
         await update.message.reply_text(
             "✅ بکاپ با موفقیت بازیابی شد.\n\n"
@@ -1169,7 +1663,7 @@ echo "OK_RESTORE"
     await update.message.reply_text("برای ادامه از منوی اصلی استفاده کنید 👇", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ------------------------- Backup menu router -------------------------
+# Backup menu router
 async def backup_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -1182,42 +1676,63 @@ async def backup_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await bk_import_existing_choose(update, context)
     if q.data == "bk_import_new":
         return await bk_import_new_start(update, context)
-    if q.data.startswith("bk_export_panel:"):
-        return await bk_export_pick_panel(update, context)
-    if q.data.startswith("bk_import_panel:"):
-        return await bk_import_pick_panel(update, context)
+    if q.data.startswith("bk_export_server:"):
+        return await bk_export_pick_server(update, context)
+    if q.data.startswith("bk_import_server:"):
+        return await bk_import_pick_server(update, context)
     if q.data == "backup_menu":
         return await backup_menu_entry(update, context)
 
     return BK_MENU
 
-# ------------------------- Main -------------------------
+# =========================
+# Main
+# =========================
 def main():
     token = env_required("TOKEN")
     app = Application.builder().token(token).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
 
-    # Conversations FIRST
-    conv_add = ConversationHandler(
-        entry_points=[CallbackQueryHandler(add_panel_entry, pattern="^add_panel$")],
+    # --- Add server conversation
+    conv_add_server = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_server_entry, pattern="^add_server$")],
         states={
-            ADD_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ip)],
-            ADD_HTTP: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_http)],
-            ADD_PANEL_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_panel_port)],
-            ADD_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_path)],
-            ADD_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_user)],
-            ADD_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_pass)],
-            ADD_SSH_HOST: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ssh_host)],
-            ADD_SSH_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ssh_user)],
-            ADD_SSH_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ssh_port)],
-            ADD_SSH_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_ssh_pass)],
+            SV_IP: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_ip)],
+            SV_SSH_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_ssh_user)],
+            SV_SSH_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_ssh_pass)],
+            SV_SSH_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_ssh_port)],
+            SV_ASK_ADD_PANEL: [CallbackQueryHandler(sv_ask_add_panel_cb, pattern=r"^sv_add_panel:(yes|no)$")],
+            SV_PANEL_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_panel_domain)],
+            SV_PANEL_SCHEME: [CallbackQueryHandler(sv_panel_scheme_cb, pattern=r"^panel_scheme:(http|https)$")],
+            SV_PANEL_PORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_panel_port)],
+            SV_PANEL_PATH: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_panel_path)],
+            SV_PANEL_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_panel_user)],
+            SV_PANEL_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, sv_panel_pass)],
         },
         fallbacks=[],
         allow_reentry=True,
     )
-    app.add_handler(conv_add)
+    app.add_handler(conv_add_server)
 
+    # --- Edit server conversation (button based)
+    conv_edit_server = ConversationHandler(
+        entry_points=[CallbackQueryHandler(edit_router_cb, pattern=r"^edit_field:")],
+        states={
+            EDIT_MENU: [
+                CallbackQueryHandler(edit_router_cb, pattern=r"^edit_field:"),
+                CallbackQueryHandler(edit_scheme_cb, pattern=r"^panel_scheme:(http|https)$"),
+            ],
+            EDIT_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_input_msg),
+            ],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+    app.add_handler(conv_edit_server)
+
+    # --- Merge conversation
     conv_merge = ConversationHandler(
         entry_points=[CallbackQueryHandler(merge_entry, pattern=r"^merge:")],
         states={
@@ -1231,13 +1746,14 @@ def main():
     )
     app.add_handler(conv_merge)
 
+    # --- Backup conversation
     conv_backup = ConversationHandler(
         entry_points=[CallbackQueryHandler(backup_menu_entry, pattern="^backup_menu$")],
         states={
             BK_MENU: [CallbackQueryHandler(backup_menu_router)],
-            BK_EXPORT_PICK_PANEL: [CallbackQueryHandler(backup_menu_router)],
+            BK_EXPORT_PICK_SERVER: [CallbackQueryHandler(backup_menu_router)],
             BK_IMPORT_CHOOSE_MODE: [CallbackQueryHandler(backup_menu_router)],
-            BK_IMPORT_PICK_PANEL: [CallbackQueryHandler(backup_menu_router)],
+            BK_IMPORT_PICK_SERVER: [CallbackQueryHandler(backup_menu_router)],
             BK_IMPORT_UPLOAD_FILE: [MessageHandler(filters.Document.ALL, bk_import_receive_file)],
             BK_IMPORT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, bk_import_confirm)],
 
@@ -1252,15 +1768,6 @@ def main():
         allow_reentry=True,
     )
     app.add_handler(conv_backup)
-
-    # Edit: فقط وقتی field=value باشد
-    conv_edit = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^[a-zA-Z_]+=") & ~filters.COMMAND, edit_value)],
-        states={EDIT_VALUE: [MessageHandler(filters.Regex(r"^[a-zA-Z_]+=") & ~filters.COMMAND, edit_value)]},
-        fallbacks=[],
-        allow_reentry=True,
-    )
-    app.add_handler(conv_edit)
 
     # Navigation AFTER conversations
     app.add_handler(CallbackQueryHandler(nav_callbacks))

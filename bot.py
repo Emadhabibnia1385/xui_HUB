@@ -87,7 +87,7 @@ def parse_int(s: str, mn: int, mx: int):
         return None
     return v
 
-def _short(s: str, n: int = 3000) -> str:
+def _short(s: str, n: int = 3500) -> str:
     s = (s or "").strip()
     return s[:n] + ("…" if len(s) > n else "")
 
@@ -106,7 +106,7 @@ def ssh_client(host: str, port: int, user: str, password: str, timeout: int = 20
     )
     return c
 
-def ssh_exec_raw(c: paramiko.SSHClient, cmd: str, read_timeout: int = 60) -> Tuple[int, str, str]:
+def ssh_exec_raw(c: paramiko.SSHClient, cmd: str, read_timeout: int = 90) -> Tuple[int, str, str]:
     _, stdout, stderr = c.exec_command(cmd, get_pty=True)
     try:
         stdout.channel.settimeout(read_timeout)
@@ -119,31 +119,26 @@ def ssh_exec_raw(c: paramiko.SSHClient, cmd: str, read_timeout: int = 60) -> Tup
     return code, out, err
 
 def ssh_exec(host: str, port: int, user: str, password: str, cmd: str,
-             conn_timeout: int = 20, read_timeout: int = 60) -> Tuple[int, str, str]:
+             conn_timeout: int = 20, read_timeout: int = 90) -> Tuple[int, str, str]:
     c = ssh_client(host, port, user, password, timeout=conn_timeout)
     try:
         return ssh_exec_raw(c, cmd, read_timeout=read_timeout)
     finally:
         c.close()
 
-# ------------------------- Build commands depending on root/non-root -------------------------
-def sudo_prefix(ssh_user: str) -> str:
-    # اگر root هستی، sudo حذف (حل قطعی مشکل تو)
-    return "" if (ssh_user or "").strip() == "root" else "sudo -n"
-
-def find_db_cmd(ssh_user: str) -> str:
-    S = sudo_prefix(ssh_user)
-    # اگر root هست، sudo لازم نیست. اگر نبود، sudo -n استفاده می‌شه.
-    return rf"""
+# ------------------------- Commands -------------------------
+def find_db_cmd() -> str:
+    # root هستیم => sudo لازم نیست
+    return r"""
 set -e
 for p in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db /var/lib/x-ui/x-ui.db /root/x-ui.db; do
   if [ -f "$p" ]; then echo "$p"; exit 0; fi
 done
 
 if command -v timeout >/dev/null 2>&1; then
-  DB=$(timeout 12s {S} find / -maxdepth 6 -name "x-ui.db" 2>/dev/null | head -n 1 || true)
+  DB=$(timeout 12s find / -maxdepth 6 -name "x-ui.db" 2>/dev/null | head -n 1 || true)
 else
-  DB=$({S} find / -maxdepth 6 -name "x-ui.db" 2>/dev/null | head -n 1 || true)
+  DB=$(find / -maxdepth 6 -name "x-ui.db" 2>/dev/null | head -n 1 || true)
 fi
 
 if [ -z "$DB" ]; then
@@ -153,59 +148,49 @@ else
 fi
 """
 
-def make_merge_script(ssh_user: str) -> str:
-    S = sudo_prefix(ssh_user)
-    # sqlite3 path auto-detect
-    # مهم: اگر root هستیم، sudo هیچوقت استفاده نمی‌شود.
-    return rf"""
+def make_merge_script_root() -> str:
+    # ✅ بدون sudo
+    # ✅ بدون وابستگی به PATH
+    # ✅ رفع کرش settings_col
+    return r"""
 set -e
 DB="$1"
 TARGET_ID="$2"
 SRC_IDS="$3"
 
-# پیدا کردن sqlite3
-SQLITE_BIN="$(command -v sqlite3 || true)"
-if [ -z "$SQLITE_BIN" ]; then
-  for p in /usr/bin/sqlite3 /bin/sqlite3 /usr/local/bin/sqlite3; do
-    if [ -f "$p" ]; then SQLITE_BIN="$p"; break; fi
-  done
-fi
+# مسیر sqlite3 را بدون PATH پیدا کن
+SQLITE_BIN=""
+for p in /usr/bin/sqlite3 /bin/sqlite3 /usr/local/bin/sqlite3; do
+  if [ -f "$p" ]; then SQLITE_BIN="$p"; break; fi
+done
 
-if [ -z "$SQLITE_BIN" ] || [ ! -f "$SQLITE_BIN" ]; then
+if [ -z "$SQLITE_BIN" ]; then
   echo "ERR_NO_SQLITE3"
   exit 10
 fi
 
-# اگر sudo استفاده می‌شود، چک کن بدون پسورد است
-if [ -n "{S}" ]; then
-  if ! sudo -n true >/dev/null 2>&1; then
-    echo "ERR_SUDO_NEEDS_PASSWORD"
-    exit 40
-  fi
-fi
+command -v python3 >/dev/null 2>&1 || { echo "ERR_NO_PYTHON3"; exit 13; }
 
-command -v python3 >/dev/null 2>&1 || {{ echo "ERR_NO_PYTHON3"; exit 13; }}
+cp "$DB" "/tmp/xuihub_db_backup_$(date +%s).db" >/dev/null 2>&1 || true
 
-{S} cp "$DB" "/tmp/xuihub_db_backup_$(date +%s).db" >/dev/null 2>&1 || true
-
-HAS_CLIENTS=$({S} "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='clients';")
+HAS_CLIENTS=$("$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='clients';")
 if [ "$HAS_CLIENTS" != "0" ]; then
-  COLS=$({S} "$SQLITE_BIN" "$DB" "SELECT group_concat(name, ',') FROM pragma_table_info('clients') WHERE name NOT IN ('id','inbound_id');")
+  COLS=$("$SQLITE_BIN" "$DB" "SELECT group_concat(name, ',') FROM pragma_table_info('clients') WHERE name NOT IN ('id','inbound_id');")
   if [ -z "$COLS" ]; then
     echo "ERR_NO_CLIENTS_TABLE"
     exit 11
   fi
 
-  HAS_UUID=$({S} "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM pragma_table_info('clients') WHERE name='uuid';")
+  HAS_UUID=$("$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM pragma_table_info('clients') WHERE name='uuid';")
   if [ "$HAS_UUID" = "0" ]; then
     echo "ERR_NO_UUID"
     exit 12
   fi
 
-  SELS=$(echo "$COLS" | awk -F',' '{{for(i=1;i<=NF;i++){{printf "c.%s", $i; if(i<NF) printf ","}}}}')
-  BEFORE=$({S} "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
+  SELS=$(echo "$COLS" | awk -F',' '{for(i=1;i<=NF;i++){printf "c.%s", $i; if(i<NF) printf ","}}')
+  BEFORE=$("$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
 
-  {S} "$SQLITE_BIN" "$DB" "BEGIN;
+  "$SQLITE_BIN" "$DB" "BEGIN;
     INSERT INTO clients (inbound_id, $COLS)
     SELECT $TARGET_ID, $SELS
     FROM clients c
@@ -213,7 +198,7 @@ if [ "$HAS_CLIENTS" != "0" ]; then
       AND c.uuid NOT IN (SELECT uuid FROM clients WHERE inbound_id=$TARGET_ID);
     COMMIT;"
 
-  AFTER=$({S} "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
+  AFTER=$("$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
   ADDED=$((AFTER-BEFORE))
   echo "OK_MODE=TABLE OK_ADDED=$ADDED BEFORE=$BEFORE AFTER=$AFTER"
   exit 0
@@ -247,11 +232,11 @@ def load_settings(inbound_id: int):
     row = cur.fetchone()
     s = row[0] if row else None
     if not s:
-        return {{}}
+        return {}
     try:
         return json.loads(s)
     except Exception:
-        return {{}}
+        return {}
 
 def save_settings(inbound_id: int, obj: dict):
     s = json.dumps(obj, ensure_ascii=False)
@@ -295,7 +280,9 @@ save_settings(target_id, tset)
 
 con.commit()
 con.close()
-print(f"OK_MODE=JSON OK_ADDED={{added}} TARGET_CLIENTS={{len(tclients)}} SETTINGS_COL={{settings_col}}")
+
+# ✅ پرینت امن
+print("OK_MODE=JSON OK_ADDED=%d TARGET_CLIENTS=%d SETTINGS_COL=%s" % (added, len(tclients), settings_col))
 PY
 """
 
@@ -325,10 +312,10 @@ async def got_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def got_ssh_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     user = "root" if txt == "/skip" else txt.strip()
-    if not user:
-        await update.message.reply_text("❌ یوزرنیم خالیه.")
+    if user != "root":
+        await update.message.reply_text("❌ این نسخه فقط برای root ساخته شده. لطفاً root یا /skip بزن.")
         return SSH_USER
-    context.user_data["ssh_user"] = user
+    context.user_data["ssh_user"] = "root"
     await update.message.reply_text("🔑 پسورد SSH را ارسال کنید:")
     return SSH_PASS
 
@@ -388,7 +375,6 @@ async def got_src_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🧾 خلاصه:\n"
         f"Server: {context.user_data['ip']}:{context.user_data['ssh_port']}\n"
-        f"SSH User: {context.user_data['ssh_user']}\n"
         f"Target: {context.user_data['target_id']}\n"
         f"Sources: {', '.join(str(x) for x in src_ids)}\n\n"
         "اگر مطمئنی انجام بده ✅",
@@ -406,7 +392,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     ip = context.user_data["ip"]
-    ssh_user = context.user_data["ssh_user"]
+    ssh_user = "root"
     ssh_pass = context.user_data["ssh_pass"]
     ssh_port = context.user_data["ssh_port"]
     target_id = int(context.user_data["target_id"])
@@ -415,10 +401,9 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text("⏳ اتصال به سرور...")
 
     try:
-        # 1) Find DB
-        fcmd = find_db_cmd(ssh_user)
+        # Find DB
         code, out, err = await asyncio.wait_for(
-            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, fcmd, 20, 60),
+            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, find_db_cmd(), 20, 90),
             timeout=60,
         )
         db_path = (out or "").strip().splitlines()[-1] if (out or "").strip() else ""
@@ -430,25 +415,29 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await q.message.reply_text(f"✅ دیتابیس: {db_path}")
 
-        # 2) Preflight sqlite check (خیلی مهم برای تشخیص دقیق)
-        pref = r"""
+        # Preflight: مسیرهای ثابت sqlite3
+        pre = r"""
 set -e
-echo "sqlite3_path=$(command -v sqlite3 || true)"
-echo "ls_usr_bin=$(ls -l /usr/bin/sqlite3 2>/dev/null || true)"
-echo "ls_bin=$(ls -l /bin/sqlite3 2>/dev/null || true)"
-echo "ver=$(sqlite3 --version 2>/dev/null || true)"
+for p in /usr/bin/sqlite3 /bin/sqlite3 /usr/local/bin/sqlite3; do
+  if [ -f "$p" ]; then
+    echo "found=$p"
+    "$p" --version || true
+    exit 0
+  fi
+done
+echo "found="
+exit 0
 """
         codep, outp, errp = await asyncio.wait_for(
-            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, pref, 20, 60),
+            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, pre, 20, 60),
             timeout=40,
         )
-        if codep == 0:
-            await q.message.reply_text("🔎 بررسی sqlite3:\n" + _short(outp, 1200))
+        await q.message.reply_text("🔎 بررسی sqlite3:\n" + _short(outp + "\n" + errp, 1200))
 
-        # 3) Merge
         await q.message.reply_text("🧩 در حال اجرای Merge ...")
+
         src_csv = ",".join(str(x) for x in src_ids)
-        merge_script = make_merge_script(ssh_user)
+        merge_script = make_merge_script_root()
 
         remote_cmd = f"""
 set -e
@@ -461,16 +450,16 @@ chmod +x "$TMP"
 """
 
         code2, out2, err2 = await asyncio.wait_for(
-            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, remote_cmd, 20, 120),
-            timeout=180,
+            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, remote_cmd, 20, 150),
+            timeout=220,
         )
 
         if code2 != 0:
             msg = (out2 + "\n" + err2).strip()
-            if "ERR_SUDO_NEEDS_PASSWORD" in msg:
-                await q.message.reply_text("❌ مشکل: sudo بدون پسورد نیست (برای یوزر غیر root).")
-            elif "ERR_NO_SQLITE3" in msg:
-                await q.message.reply_text("❌ مشکل: sqlite3 روی مسیرهای معمول پیدا نشد یا اجرا نشد.")
+            if "ERR_NO_SQLITE3" in msg:
+                await q.message.reply_text("❌ مشکل: sqlite3 از مسیرهای ثابت هم پیدا نشد.")
+            elif "ERR_NO_SETTINGS_COL" in msg:
+                await q.message.reply_text("❌ مشکل: ستون settings در جدول inbounds پیدا نشد (ساختار دیتابیس متفاوت است).")
             else:
                 await q.message.reply_text("❌ Merge ناموفق شد.")
             await q.message.reply_text(_short(msg, 3500))

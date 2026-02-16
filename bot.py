@@ -25,6 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("xui_db_merger")
 
+
 # ------------------------- .env loader (optional) -------------------------
 def load_env_file(path: str) -> None:
     if not os.path.exists(path):
@@ -43,6 +44,7 @@ def load_env_file(path: str) -> None:
     except Exception:
         logger.exception("Failed to load .env")
 
+
 def get_token() -> str:
     token = os.getenv("TOKEN", "").strip()
     if token:
@@ -53,44 +55,50 @@ def get_token() -> str:
         raise RuntimeError("TOKEN not found in environment or /opt/xui_HUB/.env")
     return token
 
+
 # ------------------------- Telegram states -------------------------
 UPLOAD_DB, ASK_TARGET, ASK_COUNT, ASK_SOURCES, CONFIRM = range(5)
 
-# ------------------------- UI Text -------------------------
+
+# ------------------------- UI -------------------------
 START_TEXT = (
     "🤖 به **xuiDB Merger** خوش آمدید\n\n"
     "این ربات برای ادغام کلاینت‌های چند Inbound داخل دیتابیس **x-ui.db** ساخته شده است.\n"
     "✅ فقط دیتابیس می‌گیرد، ادغام می‌کند، و دیتابیس جدید تحویل می‌دهد.\n"
     "⛔️ هیچ SSH و هیچ ریستارت سرویس انجام نمی‌دهد.\n\n"
-    "از دکمه زیر شروع کنید 👇\n"
+    "از دکمه زیر شروع کنید 👇"
 )
 
+
 def kb_start() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ شروع ادغام دیتابیس", callback_data="start_merge_db")],
-    ])
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("➕ شروع ادغام دیتابیس", callback_data="start_merge_db")]]
+    )
+
 
 def kb_confirm() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ انجام بده", callback_data="do_merge"),
-            InlineKeyboardButton("❌ لغو", callback_data="cancel_merge"),
-        ]
-    ])
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✅ انجام بده", callback_data="do_merge"),
+          InlineKeyboardButton("❌ لغو", callback_data="cancel_merge")]]
+    )
+
 
 # ------------------------- Helpers -------------------------
 def is_int_id(s: str) -> bool:
-    s = s.strip()
+    s = (s or "").strip()
     return bool(re.fullmatch(r"\d+", s))
+
 
 def short_err(e: Exception) -> str:
     msg = str(e).strip()
     return msg[:1500] + ("…" if len(msg) > 1500 else "")
 
+
 def table_exists(con: sqlite3.Connection, name: str) -> bool:
     cur = con.cursor()
     cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1;", (name,))
     return cur.fetchone() is not None
+
 
 def get_inbounds_settings_col(con: sqlite3.Connection) -> Optional[str]:
     cur = con.cursor()
@@ -100,6 +108,7 @@ def get_inbounds_settings_col(con: sqlite3.Connection) -> Optional[str]:
         if cand in cols:
             return cand
     return None
+
 
 def load_settings(con: sqlite3.Connection, settings_col: str, inbound_id: int) -> dict:
     cur = con.cursor()
@@ -112,45 +121,38 @@ def load_settings(con: sqlite3.Connection, settings_col: str, inbound_id: int) -
     except Exception:
         return {}
 
+
 def save_settings(con: sqlite3.Connection, settings_col: str, inbound_id: int, obj: dict) -> None:
     s = json.dumps(obj, ensure_ascii=False)
     cur = con.cursor()
     cur.execute(f"UPDATE inbounds SET {settings_col}=? WHERE id=?;", (s, inbound_id))
 
+
 def client_key(c: dict) -> Tuple[str, str]:
-    # بهترین کلید برای جلوگیری از تکراری
     for k in ("uuid", "id", "email", "password"):
         v = c.get(k)
         if isinstance(v, str) and v.strip():
             return (k, v.strip())
     return ("raw", json.dumps(c, sort_keys=True, ensure_ascii=False))
 
+
 def merge_clients_table(con: sqlite3.Connection, target_id: int, source_ids: List[int]) -> int:
-    """
-    Merge from clients table:
-    INSERT clients from sources into target, dedup by uuid
-    """
     cur = con.cursor()
-    # بررسی uuid
     cur.execute("PRAGMA table_info(clients);")
     cols = [r[1] for r in cur.fetchall()]
     if "uuid" not in cols:
         raise RuntimeError("ستون uuid در جدول clients وجود ندارد.")
 
-    # ستون‌های قابل انتقال (به جز id و inbound_id)
     cols_to_copy = [c for c in cols if c not in ("id", "inbound_id")]
     if not cols_to_copy:
         raise RuntimeError("ستون قابل انتقال در clients پیدا نشد.")
 
-    # شمارش قبل
     cur.execute("SELECT COUNT(*) FROM clients WHERE inbound_id=?;", (target_id,))
     before = int(cur.fetchone()[0])
 
-    # ساخت query
     cols_sql = ",".join(cols_to_copy)
     select_sql = ",".join([f"c.{c}" for c in cols_to_copy])
 
-    # Dedup by uuid in target
     src_placeholders = ",".join(["?"] * len(source_ids))
     sql = f"""
     INSERT INTO clients (inbound_id, {cols_sql})
@@ -167,6 +169,7 @@ def merge_clients_table(con: sqlite3.Connection, target_id: int, source_ids: Lis
     cur.execute("SELECT COUNT(*) FROM clients WHERE inbound_id=?;", (target_id,))
     after = int(cur.fetchone()[0])
     return max(0, after - before)
+
 
 def merge_clients_in_settings(con: sqlite3.Connection, target_id: int, source_ids: List[int]) -> int:
     settings_col = get_inbounds_settings_col(con)
@@ -203,51 +206,77 @@ def merge_clients_in_settings(con: sqlite3.Connection, target_id: int, source_id
     save_settings(con, settings_col, target_id, tset)
     return added
 
-def merge_db(input_db: str, output_db: str, target_id: int, source_ids: List[int]) -> Tuple[str, int]:
-    """
-    returns (mode, added_count)
-    """
-    shutil.copy2(input_db, output_db)
 
-    con = sqlite3.connect(output_db)
+def merge_db_for_import(input_db: str, output_db: str, target_id: int, source_ids: List[int]) -> Tuple[str, int]:
+    """
+    خروجی استاندارد و تک‌فایل برای Import:
+    - کپی به work
+    - merge
+    - wal_checkpoint + journal_mode=DELETE
+    - VACUUM INTO output_db  (خروجی تمیز)
+    """
+    work_db = output_db + ".work"
+    shutil.copy2(input_db, work_db)
+
+    con = sqlite3.connect(work_db)
     try:
-        # sanity: ensure inbounds exists
         if not table_exists(con, "inbounds"):
-            raise RuntimeError("جدول inbounds در دیتابیس وجود ندارد. این فایل x-ui.db معتبر نیست.")
+            raise RuntimeError("جدول inbounds وجود ندارد؛ این فایل x-ui.db معتبر نیست.")
 
-        # check target exists
         cur = con.cursor()
         cur.execute("SELECT 1 FROM inbounds WHERE id=? LIMIT 1;", (target_id,))
         if cur.fetchone() is None:
-            raise RuntimeError(f"Inbound مقصد با id={target_id} داخل دیتابیس پیدا نشد.")
+            raise RuntimeError(f"Inbound مقصد با id={target_id} داخل دیتابیس نیست.")
 
-        # check sources exist
         missing = []
         for sid in source_ids:
             cur.execute("SELECT 1 FROM inbounds WHERE id=? LIMIT 1;", (sid,))
             if cur.fetchone() is None:
                 missing.append(sid)
         if missing:
-            raise RuntimeError(f"این inboundهای ورودی داخل دیتابیس وجود ندارند: {missing}")
+            raise RuntimeError(f"Inboundهای ورودی داخل دیتابیس نیستند: {missing}")
 
-        # choose merge mode
+        # merge
         if table_exists(con, "clients"):
             added = merge_clients_table(con, target_id, source_ids)
-            con.commit()
-            return ("TABLE", added)
+            mode = "TABLE"
+        else:
+            added = merge_clients_in_settings(con, target_id, source_ids)
+            mode = "JSON"
 
-        # fallback: JSON settings
-        added = merge_clients_in_settings(con, target_id, source_ids)
         con.commit()
-        return ("JSON", added)
+
+        # make import-friendly (fix WAL / file format issues)
+        con.execute("PRAGMA wal_checkpoint(FULL);")
+        con.execute("PRAGMA journal_mode=DELETE;")
+        con.commit()
+
+        # produce clean single-file db
+        try:
+            con.execute(f"VACUUM INTO '{output_db}';")
+            con.commit()
+        except sqlite3.OperationalError:
+            # اگر VACUUM INTO پشتیبانی نشد: fallback
+            # (اکثر سرورها دارند، ولی برای اطمینان)
+            con.execute("VACUUM;")
+            con.commit()
+            shutil.copy2(work_db, output_db)
+
+        return mode, added
 
     finally:
         con.close()
+        try:
+            os.remove(work_db)
+        except Exception:
+            pass
+
 
 # ------------------------- Handlers -------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(START_TEXT, reply_markup=kb_start(), parse_mode="Markdown")
+
 
 async def start_merge_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -255,10 +284,11 @@ async def start_merge_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await q.edit_message_text(
         "📦 لطفاً فایل دیتابیس **x-ui.db** را به صورت Document ارسال کنید.\n\n"
-        "نکته: فقط فایل .db بفرستید (عکس یا زیپ نباشد).",
+        "نکته: فقط فایل .db بفرستید (زیپ یا عکس نباشد).",
         parse_mode="Markdown",
     )
     return UPLOAD_DB
+
 
 async def recv_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
@@ -286,6 +316,7 @@ async def recv_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ASK_TARGET
 
+
 async def ask_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not is_int_id(text):
@@ -300,11 +331,13 @@ async def ask_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ASK_COUNT
 
+
 async def ask_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not is_int_id(text):
         await update.message.reply_text("❌ فقط عدد ارسال کنید (مثلاً 3).")
         return ASK_COUNT
+
     n = int(text)
     if not (1 <= n <= 30):
         await update.message.reply_text("❌ تعداد باید بین 1 تا 30 باشد.")
@@ -312,8 +345,10 @@ async def ask_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["src_count"] = n
     context.user_data["src_ids"] = []
+
     await update.message.reply_text("✅ عالی. حالا ID ورودی شماره 1 را ارسال کنید:")
     return ASK_SOURCES
+
 
 async def ask_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -328,10 +363,10 @@ async def ask_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     n = int(context.user_data["src_count"])
     if len(src_ids) < n:
-        await update.message.reply_text(f"✅ ثبت شد. حالا ID ورودی شماره {len(src_ids)+1} را ارسال کنید:")
+        await update.message.reply_text(f"✅ ثبت شد. حالا ID ورودی شماره {len(src_ids) + 1} را ارسال کنید:")
         return ASK_SOURCES
 
-    target_id = context.user_data["target_id"]
+    target_id = int(context.user_data["target_id"])
     await update.message.reply_text(
         "🧾 خلاصه درخواست شما:\n\n"
         f"🎯 مقصد: {target_id}\n"
@@ -341,12 +376,12 @@ async def ask_sources(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return CONFIRM
 
+
 async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
     if q.data == "cancel_merge":
-        # پاکسازی فایل موقت
         db_in = context.user_data.get("db_in")
         try:
             if db_in and os.path.exists(db_in):
@@ -371,23 +406,22 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await q.edit_message_text("⏳ در حال ادغام... لطفاً چند ثانیه صبر کنید.")
 
-    # خروجی
     out_path = None
     try:
         with tempfile.NamedTemporaryFile(prefix="xui_merged_", suffix=".db", delete=False) as f:
             out_path = f.name
 
-        mode, added = merge_db(db_in, out_path, target_id, src_ids)
+        mode, added = merge_db_for_import(db_in, out_path, target_id, src_ids)
 
-        # ارسال فایل
         caption = (
             "✅ ادغام انجام شد.\n\n"
             f"🔧 Mode: {mode}\n"
             f"➕ Added clients: {added}\n\n"
-            "📦 دیتابیس جدید آماده است:"
+            "📦 دیتابیس جدید آماده است (برای Import):"
         )
+
         await q.message.reply_document(
-            document=InputFile(out_path, filename="x-ui_merged.db"),
+            document=InputFile(out_path, filename="x-ui.db"),
             caption=caption,
         )
 
@@ -401,7 +435,6 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "نکته: مطمئن شو IDها درست هستند و این فایل واقعاً x-ui.db است."
         )
     finally:
-        # پاکسازی
         try:
             if db_in and os.path.exists(db_in):
                 os.remove(db_in)
@@ -416,6 +449,7 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     return ConversationHandler.END
 
+
 # ------------------------- Global error handler -------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception: %s", context.error)
@@ -427,6 +461,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await update.callback_query.message.reply_text("⚠️ یک خطای داخلی رخ داد. لطفاً دوباره تلاش کنید.")
     except Exception:
         pass
+
 
 # ------------------------- Main -------------------------
 def main():
@@ -449,12 +484,10 @@ def main():
     )
     app.add_handler(conv)
 
-    # در صورت کلیک دکمه /start در چت‌های قدیمی
-    app.add_handler(CallbackQueryHandler(start_merge_btn, pattern="^start_merge_db$"))
-
     app.add_error_handler(on_error)
 
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

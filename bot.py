@@ -3,6 +3,7 @@ import json
 import re
 import asyncio
 import tempfile
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, Tuple
 
@@ -17,6 +18,14 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+# ------------------------- Logging -------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("xuihub")
+
 
 STORE_FILE = "store.json"
 
@@ -93,16 +102,35 @@ def to_fa_digits(s: str) -> str:
     return s.translate(PERSIAN_DIGITS)
 
 
-# ------------------------- SSH helpers -------------------------
-def ssh_client(host: str, port: int, user: str, password: str, timeout: int = 25) -> paramiko.SSHClient:
+# ------------------------- SSH helpers (ROBUST + TIMEOUT) -------------------------
+def ssh_client(host: str, port: int, user: str, password: str, timeout: int = 20) -> paramiko.SSHClient:
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    c.connect(hostname=host, port=port, username=user, password=password, timeout=timeout)
+    # banner_timeout / auth_timeout برای جلوگیری از هنگ
+    c.connect(
+        hostname=host,
+        port=port,
+        username=user,
+        password=password,
+        timeout=timeout,
+        banner_timeout=timeout,
+        auth_timeout=timeout,
+    )
     return c
 
 
-def ssh_exec_raw(c: paramiko.SSHClient, cmd: str) -> Tuple[int, str, str]:
+def ssh_exec_raw(c: paramiko.SSHClient, cmd: str, read_timeout: int = 35) -> Tuple[int, str, str]:
+    """
+    read_timeout: برای اینکه stdout.read() گیر نکند.
+    """
     _, stdout, stderr = c.exec_command(cmd, get_pty=True)
+    # timeout روی کانال‌ها
+    try:
+        stdout.channel.settimeout(read_timeout)
+        stderr.channel.settimeout(read_timeout)
+    except Exception:
+        pass
+
     out = stdout.read().decode("utf-8", errors="ignore")
     err = stderr.read().decode("utf-8", errors="ignore")
     code = stdout.channel.recv_exit_status()
@@ -115,23 +143,29 @@ def ssh_exec(
     user: str,
     password: str,
     cmd: str,
-    timeout: int = 25,
+    conn_timeout: int = 20,
+    read_timeout: int = 35,
 ) -> Tuple[int, str, str]:
-    c = ssh_client(host, port, user, password, timeout=timeout)
-    code, out, err = ssh_exec_raw(c, cmd)
-    c.close()
+    c = ssh_client(host, port, user, password, timeout=conn_timeout)
+    try:
+        code, out, err = ssh_exec_raw(c, cmd, read_timeout=read_timeout)
+    finally:
+        c.close()
     return code, out, err
 
 
+# ------------------------- FAST FIND DB (NO HANG) -------------------------
+# اول مسیرهای رایج، بعد یک find زمان‌دار
 FIND_DB_CMD = r"""
 set -e
-DB=$(sudo find / -maxdepth 6 -name "x-ui.db" 2>/dev/null | head -n 1 || true)
-if [ -z "$DB" ]; then
-  for p in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db; do
-    if [ -f "$p" ]; then
-      DB="$p"; break
-    fi
-  done
+for p in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db /var/lib/x-ui/x-ui.db /root/x-ui.db; do
+  if [ -f "$p" ]; then echo "$p"; exit 0; fi
+done
+
+if command -v timeout >/dev/null 2>&1; then
+  DB=$(timeout 12s sudo find / -maxdepth 6 -name "x-ui.db" 2>/dev/null | head -n 1 || true)
+else
+  DB=$(sudo find / -maxdepth 6 -name "x-ui.db" 2>/dev/null | head -n 1 || true)
 fi
 
 if [ -z "$DB" ]; then
@@ -147,6 +181,7 @@ def inbound_id_by_port_cmd(db_path: str, port: int) -> str:
 
 
 def make_merge_script() -> str:
+    # همون اسکریپت شماست فقط تمیز
     return r"""
 set -e
 DB="$1"
@@ -371,7 +406,7 @@ def env_required(name: str) -> str:
     return v
 
 
-# ------------------------- Start & Navigation -------------------------
+# ------------------------- UI Text -------------------------
 START_TEXT = (
     "🤖 **به xui_HUB خوش آمدید**\n\n"
     "xui_HUB یک ربات حرفه‌ای برای مدیریت پنل‌های **3x-ui / x-ui** است.\n"
@@ -381,10 +416,30 @@ START_TEXT = (
 )
 
 
+# ------------------------- Helpers for safe user error messages -------------------------
+def _short(s: str, n: int = 1800) -> str:
+    s = (s or "").strip()
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+async def report_error(update: Update, title: str, detail: str, extra: str = ""):
+    msg = f"❌ **{title}**\n\n{detail}"
+    if extra.strip():
+        msg += f"\n\n```text\n{_short(extra, 1500)}\n```"
+    if update.message:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    elif update.callback_query:
+        try:
+            await update.callback_query.message.reply_text(msg, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(START_TEXT, reply_markup=kb_main(), parse_mode="Markdown")
 
 
+# ------------------------- Navigation callbacks (only non-conv buttons) -------------------------
 async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -412,7 +467,6 @@ async def nav_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         rows = [[InlineKeyboardButton(f"🔀 {pid}", callback_data=f"merge:{pid}")] for pid in bucket["order"]]
         rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="back_main")])
-
         await q.edit_message_text(
             "🔀 **مدیریت پورت و کانفیگ**\n\nپنلی که می‌خواهید عملیات روی آن انجام شود را انتخاب کنید:",
             reply_markup=InlineKeyboardMarkup(rows),
@@ -505,7 +559,6 @@ async def add_http(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if v not in ("http", "https"):
         await update.message.reply_text("فقط HTTP یا HTTPS ارسال کنید.", parse_mode="Markdown")
         return ADD_HTTP
-
     context.user_data["new_panel"]["panel_scheme"] = v
     await update.message.reply_text("🔢 پورت پنل را ارسال کنید:")
     return ADD_PANEL_PORT
@@ -519,7 +572,6 @@ async def add_panel_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("پورت معتبر ارسال کنید (1..65535).")
         return ADD_PANEL_PORT
-
     context.user_data["new_panel"]["panel_port"] = port
     await update.message.reply_text("🧭 پچ پنل (مثلاً /panel) — اگر ندارید /:")
     return ADD_PATH
@@ -566,7 +618,6 @@ async def add_ssh_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("پورت معتبر ارسال کنید (1..65535).")
         return ADD_SSH_PORT
-
     context.user_data["new_panel"]["ssh_port"] = port
     await update.message.reply_text("🔑 SSH Password:")
     return ADD_SSH_PASS
@@ -574,14 +625,12 @@ async def add_ssh_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_ssh_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_panel"]["ssh_pass"] = update.message.text.strip()
-
     store = load_store()
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
 
     host = context.user_data["new_panel"]["panel_host"]
     pid = safe_panel_id(host)
-
     base = pid
     i = 2
     while pid in bucket["panels"]:
@@ -624,7 +673,6 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "ssh_port",
         "ssh_pass",
     }
-
     if key not in allowed:
         await update.message.reply_text("نام فیلد اشتباه است. دوباره ارسال کنید.")
         return EDIT_VALUE
@@ -652,7 +700,6 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     store = load_store()
     bucket = get_user_bucket(store, update.effective_user.id)
-
     if pid not in bucket["panels"]:
         context.user_data.clear()
         await update.message.reply_text("پنل پیدا نشد.", reply_markup=kb_main())
@@ -666,7 +713,7 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ------------------------- Merge flow -------------------------
+# ------------------------- Merge flow (ROBUST) -------------------------
 async def merge_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -719,7 +766,6 @@ async def merge_ports(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     m["ports"].append(port)
     idx = len(m["ports"])
-
     if idx < m["count"]:
         await update.message.reply_text(f"✅ پورت {idx} ثبت شد. پورت بعدی (پورت {idx + 1}):")
         return MERGE_PORTS
@@ -758,8 +804,8 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
 
-    pid = context.user_data["merge"]["panel_id"]
-    panel = bucket["panels"].get(pid)
+    pid = context.user_data.get("merge", {}).get("panel_id")
+    panel = bucket["panels"].get(pid) if pid else None
     if not panel:
         context.user_data.clear()
         await update.message.reply_text("❌ پنل پیدا نشد.", reply_markup=kb_main())
@@ -768,60 +814,118 @@ async def merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     src_ports = context.user_data["merge"]["ports"]
     target_port = context.user_data["merge"]["target_port"]
 
-    await update.message.reply_text("⏳ در حال اتصال و انجام ادغام...")
+    # پیام‌های مرحله‌ای
+    await update.message.reply_text("⏳ شروع ادغام... (اتصال SSH)")
+    try:
+        # 1) Find DB with timeout wrapper
+        await update.message.reply_text("🔎 در حال پیدا کردن دیتابیس x-ui.db ...")
+        try:
+            code, out, err = await asyncio.wait_for(
+                asyncio.to_thread(
+                    ssh_exec,
+                    panel["ssh_host"],
+                    panel["ssh_port"],
+                    panel["ssh_user"],
+                    panel["ssh_pass"],
+                    FIND_DB_CMD,
+                ),
+                timeout=45,
+            )
+        except asyncio.TimeoutError:
+            context.user_data.clear()
+            await report_error(
+                update,
+                "Timeout در پیدا کردن دیتابیس",
+                "سرور پاسخ نداد یا دستور جستجوی دیتابیس طولانی شد.",
+                "راه‌حل: مسیر دیتابیس را در سرور ثابت کنید یا timeout را بالا ببرید.",
+            )
+            return ConversationHandler.END
 
-    code, out, err = await asyncio.to_thread(
-        ssh_exec,
-        panel["ssh_host"],
-        panel["ssh_port"],
-        panel["ssh_user"],
-        panel["ssh_pass"],
-        FIND_DB_CMD,
-    )
-    db_path = out.strip().splitlines()[-1] if out.strip() else ""
-    if "NOT_FOUND" in db_path or not db_path:
-        context.user_data.clear()
-        await update.message.reply_text("❌ دیتابیس x-ui.db پیدا نشد یا sudo ندارم.", reply_markup=kb_main())
-        return ConversationHandler.END
+        db_path = out.strip().splitlines()[-1] if out.strip() else ""
+        if code != 0:
+            context.user_data.clear()
+            await report_error(update, "خطا در اجرای دستور پیدا کردن DB", "کد خروجی غیر صفر.", out + "\n" + err)
+            return ConversationHandler.END
 
-    def get_inbound_id(port: int) -> Optional[int]:
-        c, o, e = ssh_exec(
-            panel["ssh_host"],
-            panel["ssh_port"],
-            panel["ssh_user"],
-            panel["ssh_pass"],
-            inbound_id_by_port_cmd(db_path, port),
-        )
-        v = o.strip()
-        return int(v) if v.isdigit() else None
+        if "NOT_FOUND" in db_path or not db_path:
+            context.user_data.clear()
+            await report_error(
+                update,
+                "دیتابیس پیدا نشد",
+                "x-ui.db پیدا نشد یا دسترسی sudo ندارید.",
+                out + "\n" + err,
+            )
+            return ConversationHandler.END
 
-    target_id = await asyncio.to_thread(get_inbound_id, target_port)
-    if not target_id:
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"❌ inbound مقصد با پورت {target_port} پیدا نشد. اول داخل پنل بساز.",
-            reply_markup=kb_main(),
-        )
-        return ConversationHandler.END
+        await update.message.reply_text(f"✅ دیتابیس پیدا شد:\n`{db_path}`", parse_mode="Markdown")
 
-    source_ids = []
-    missing = []
-    for p in src_ports:
-        iid = await asyncio.to_thread(get_inbound_id, p)
-        if not iid:
-            missing.append(p)
-        else:
-            source_ids.append(iid)
+        # 2) inbound ids
+        async def get_inbound_id(port: int) -> Optional[int]:
+            cmd = inbound_id_by_port_cmd(db_path, port)
+            try:
+                code2, o2, e2 = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        ssh_exec,
+                        panel["ssh_host"],
+                        panel["ssh_port"],
+                        panel["ssh_user"],
+                        panel["ssh_pass"],
+                        cmd,
+                    ),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"Timeout در گرفتن inbound برای پورت {port}")
 
-    if missing:
-        context.user_data.clear()
-        await update.message.reply_text(f"❌ این پورت‌ها پیدا نشدند: {missing}", reply_markup=kb_main())
-        return ConversationHandler.END
+            v = (o2 or "").strip()
+            return int(v) if v.isdigit() else None
 
-    src_ids_csv = ",".join(str(x) for x in source_ids)
-    merge_script = make_merge_script()
+        await update.message.reply_text("🔎 در حال پیدا کردن inbound مقصد ...")
+        try:
+            target_id = await get_inbound_id(target_port)
+        except Exception as e:
+            context.user_data.clear()
+            await report_error(update, "خطا در گرفتن inbound مقصد", str(e))
+            return ConversationHandler.END
 
-    remote_cmd = f"""
+        if not target_id:
+            context.user_data.clear()
+            await report_error(
+                update,
+                "inbound مقصد پیدا نشد",
+                f"inbound مقصد با پورت {target_port} پیدا نشد. اول داخل پنل بساز.",
+            )
+            return ConversationHandler.END
+
+        await update.message.reply_text(f"✅ inbound مقصد: {target_id}")
+
+        await update.message.reply_text("🔎 در حال پیدا کردن inbound ورودی‌ها ...")
+        source_ids = []
+        missing = []
+        for p in src_ports:
+            try:
+                iid = await get_inbound_id(p)
+            except Exception as e:
+                context.user_data.clear()
+                await report_error(update, "خطا در گرفتن inbound ورودی", f"پورت {p}: {e}")
+                return ConversationHandler.END
+
+            if not iid:
+                missing.append(p)
+            else:
+                source_ids.append(iid)
+
+        if missing:
+            context.user_data.clear()
+            await report_error(update, "برخی پورت‌ها پیدا نشدند", f"این پورت‌ها inbound ندارند: {missing}")
+            return ConversationHandler.END
+
+        src_ids_csv = ",".join(str(x) for x in source_ids)
+
+        # 3) run merge script
+        await update.message.reply_text("🧩 در حال اجرای اسکریپت ادغام روی سرور ...")
+        merge_script = make_merge_script()
+        remote_cmd = f"""
 set -e
 TMP=/tmp/xuihub_merge.sh
 cat > $TMP <<'EOS'
@@ -831,33 +935,63 @@ chmod +x $TMP
 sudo $TMP "{db_path}" "{target_id}" "{src_ids_csv}"
 """
 
-    code, out, err = await asyncio.to_thread(
-        ssh_exec,
-        panel["ssh_host"],
-        panel["ssh_port"],
-        panel["ssh_user"],
-        panel["ssh_pass"],
-        remote_cmd,
-    )
+        try:
+            code3, out3, err3 = await asyncio.wait_for(
+                asyncio.to_thread(
+                    ssh_exec,
+                    panel["ssh_host"],
+                    panel["ssh_port"],
+                    panel["ssh_user"],
+                    panel["ssh_pass"],
+                    remote_cmd,
+                ),
+                timeout=70,
+            )
+        except asyncio.TimeoutError:
+            context.user_data.clear()
+            await report_error(
+                update,
+                "Timeout در اجرای Merge",
+                "اسکریپت ادغام زمان‌بر شد یا گیر کرد.",
+                "احتمالاً sudo پسورد می‌خواهد یا sqlite3/DB مشکل دارد.",
+            )
+            return ConversationHandler.END
 
-    if code != 0:
+        if code3 != 0:
+            context.user_data.clear()
+            await report_error(update, "ادغام با خطا انجام شد", "کد خروجی غیر صفر.", out3 + "\n" + err3)
+            return ConversationHandler.END
+
+        await update.message.reply_text(f"✅ خروجی ادغام:\n```text\n{_short(out3, 1600)}\n```", parse_mode="Markdown")
+
+        # 4) restart x-ui
+        await update.message.reply_text("🔄 در حال ریستارت سرویس x-ui ...")
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    ssh_exec,
+                    panel["ssh_host"],
+                    panel["ssh_port"],
+                    panel["ssh_user"],
+                    panel["ssh_pass"],
+                    "sudo x-ui restart || sudo systemctl restart x-ui || true",
+                ),
+                timeout=35,
+            )
+        except asyncio.TimeoutError:
+            # ریستارت اگر تایم اوت شد هم ادغام انجام شده؛ فقط اطلاع بده
+            await update.message.reply_text("⚠️ ریستارت سرویس طولانی شد/timeout خورد، ولی ادغام انجام شده است.")
+
         context.user_data.clear()
-        msg = (out + "\n" + err).strip()
-        await update.message.reply_text(f"❌ خطا:\n{msg[:3500]}", reply_markup=kb_main())
+        await update.message.reply_text("🎉 **ادغام با موفقیت انجام شد.**", parse_mode="Markdown", reply_markup=kb_main())
         return ConversationHandler.END
 
-    await asyncio.to_thread(
-        ssh_exec,
-        panel["ssh_host"],
-        panel["ssh_port"],
-        panel["ssh_user"],
-        panel["ssh_pass"],
-        "sudo x-ui restart || sudo systemctl restart x-ui || true",
-    )
-
-    context.user_data.clear()
-    await update.message.reply_text(f"✅ ادغام انجام شد.\n{out.strip()}", reply_markup=kb_main())
-    return ConversationHandler.END
+    except Exception as e:
+        logger.exception("merge_confirm crashed")
+        context.user_data.clear()
+        await report_error(update, "خطای غیرمنتظره در Merge", str(e))
+        await update.message.reply_text("برای ادامه از منوی اصلی استفاده کنید 👇", reply_markup=kb_main())
+        return ConversationHandler.END
 
 
 # ------------------------- Backup helpers -------------------------
@@ -893,6 +1027,8 @@ async def find_db_path(panel: Dict[str, Any]) -> Optional[str]:
         FIND_DB_CMD,
     )
     db_path = out.strip().splitlines()[-1] if out.strip() else ""
+    if code != 0:
+        return None
     if "NOT_FOUND" in db_path or not db_path:
         return None
     return db_path
@@ -909,7 +1045,7 @@ async def restart_xui(panel: Dict[str, Any]) -> None:
     )
 
 
-# ------------------------- Backup flow -------------------------
+# ------------------------- Backup flow (same as before, but safe) -------------------------
 async def backup_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -927,7 +1063,6 @@ async def backup_menu_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bk_export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     store = load_store()
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
@@ -938,7 +1073,6 @@ async def bk_export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = [[InlineKeyboardButton(f"📤 {pid}", callback_data=f"bk_export_panel:{pid}")] for pid in bucket["order"]]
     rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="backup_menu")])
-
     await q.edit_message_text("📤 پنل موردنظر برای بکاپ را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
     return BK_EXPORT_PICK_PANEL
 
@@ -946,8 +1080,8 @@ async def bk_export_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def bk_export_pick_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     pid = q.data.split(":", 1)[1]
+
     store = load_store()
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
@@ -958,7 +1092,6 @@ async def bk_export_pick_panel(update: Update, context: ContextTypes.DEFAULT_TYP
         return ConversationHandler.END
 
     await q.edit_message_text("⏳ در حال گرفتن بکاپ...")
-
     db_path = await find_db_path(panel)
     if not db_path:
         await q.edit_message_text("❌ دیتابیس x-ui.db پیدا نشد یا دسترسی sudo ندارم.", reply_markup=kb_main())
@@ -983,15 +1116,14 @@ echo "{remote_tmp}"
         panel["ssh_pass"],
         remote_cmd,
     )
-
     if code != 0:
         msg = (out + "\n" + err).strip()
-        await q.edit_message_text(f"❌ خطا:\n{msg[:3500]}", reply_markup=kb_main())
+        await q.edit_message_text(f"❌ خطا:\n{_short(msg, 3500)}", reply_markup=kb_main())
         return ConversationHandler.END
 
     remote_file = out.strip().splitlines()[-1] if out.strip() else remote_tmp
-
     local_path = None
+
     try:
         with tempfile.NamedTemporaryFile(prefix="xuihub_backup_", suffix=".db", delete=False) as f:
             local_path = f.name
@@ -1040,7 +1172,6 @@ async def bk_import_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
-
     await q.edit_message_text(
         "📥 **وارد کردن بکاپ (Restore)**\n\nروش بازیابی را انتخاب کنید:",
         reply_markup=kb_backup_import_mode(),
@@ -1062,10 +1193,8 @@ async def bk_import_existing_choose(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
 
     context.user_data.clear()
-
     rows = [[InlineKeyboardButton(f"🔁 {pid}", callback_data=f"bk_import_panel:{pid}")] for pid in bucket["order"]]
     rows.append([InlineKeyboardButton("⬅️ بازگشت", callback_data="backup_menu")])
-
     await q.edit_message_text("🔁 پنل مقصد برای Restore را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(rows))
     return BK_IMPORT_PICK_PANEL
 
@@ -1073,8 +1202,8 @@ async def bk_import_existing_choose(update: Update, context: ContextTypes.DEFAUL
 async def bk_import_pick_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-
     pid = q.data.split(":", 1)[1]
+
     store = load_store()
     user_id = update.effective_user.id
     bucket = get_user_bucket(store, user_id)
@@ -1161,23 +1290,21 @@ sudo chmod 600 "{db_path}" || true
 sudo rm -f "{remote_upload}" || true
 echo "OK_RESTORE"
 """
-            code, out, err = ssh_exec_raw(c, cmd)
+            code, out, err = ssh_exec_raw(c, cmd, read_timeout=50)
             c.close()
             return code, out, err
 
         code, out, err = await asyncio.to_thread(sftp_upload_and_restore)
         if code != 0:
-            raise RuntimeError((out + "\n" + err).strip()[:3500])
+            raise RuntimeError(_short((out + "\n" + err).strip(), 3500))
 
         await restart_xui(panel)
         await update.message.reply_text(
             "✅ بکاپ با موفقیت بازیابی شد.\n\n" f"📌 بکاپ قبلی (برای اطمینان) ذخیره شد:\n{remote_backup_old}",
             parse_mode="Markdown",
         )
-
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در Restore:\n{e}")
-
     finally:
         try:
             os.remove(local_file)
@@ -1219,7 +1346,6 @@ async def bk_new_ssh_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("پورت معتبر ارسال کنید (1..65535).")
         return BK_IMPORT_NEW_SSH_PORT
-
     context.user_data["new_ssh"]["port"] = p
     await update.message.reply_text("🔑 SSH Password را ارسال کنید:")
     return BK_IMPORT_NEW_SSH_PASS
@@ -1311,13 +1437,13 @@ sudo chmod 600 "{db_path}" || true
 sudo rm -f "{remote_upload}" || true
 echo "OK_RESTORE"
 """
-            code, out, err = ssh_exec_raw(c, cmd)
+            code, out, err = ssh_exec_raw(c, cmd, read_timeout=50)
             c.close()
             return code, out, err
 
         code, out, err = await asyncio.to_thread(sftp_upload_and_restore_new)
         if code != 0:
-            raise RuntimeError((out + "\n" + err).strip()[:3500])
+            raise RuntimeError(_short((out + "\n" + err).strip(), 3500))
 
         await restart_xui(panel)
         await update.message.reply_text(
@@ -1326,10 +1452,8 @@ echo "OK_RESTORE"
             "ℹ️ هیچ اطلاعاتی از این سرور ذخیره نشد و همه اطلاعات موقت پاک شد.",
             parse_mode="Markdown",
         )
-
     except Exception as e:
         await update.message.reply_text(f"❌ خطا در Restore:\n{e}")
-
     finally:
         try:
             os.remove(local_file)
@@ -1360,8 +1484,18 @@ async def backup_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return await bk_import_pick_panel(update, context)
     if q.data == "backup_menu":
         return await backup_menu_entry(update, context)
-
     return BK_MENU
+
+
+# ------------------------- Global error handler -------------------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled exception: %s", context.error)
+    # اگر update موجود بود، به کاربر پیام بده
+    try:
+        if isinstance(update, Update):
+            await report_error(update, "خطای داخلی ربات", "یک خطای غیرمنتظره رخ داد. دوباره تلاش کنید.")
+    except Exception:
+        pass
 
 
 # ------------------------- Main -------------------------
@@ -1371,7 +1505,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
 
-    # Conversations FIRST (خیلی مهم)
+    # Conversations FIRST
     conv_add = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_panel_entry, pattern="^add_panel$")],
         states={
@@ -1389,6 +1523,7 @@ def main():
         fallbacks=[],
         allow_reentry=True,
     )
+    app.add_handler(conv_add)
 
     conv_merge = ConversationHandler(
         entry_points=[CallbackQueryHandler(merge_entry, pattern=r"^merge:")],
@@ -1401,6 +1536,7 @@ def main():
         fallbacks=[],
         allow_reentry=True,
     )
+    app.add_handler(conv_merge)
 
     conv_backup = ConversationHandler(
         entry_points=[CallbackQueryHandler(backup_menu_entry, pattern="^backup_menu$")],
@@ -1421,6 +1557,7 @@ def main():
         fallbacks=[],
         allow_reentry=True,
     )
+    app.add_handler(conv_backup)
 
     conv_edit = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^[a-zA-Z_]+=") & ~filters.COMMAND, edit_value)],
@@ -1428,20 +1565,17 @@ def main():
         fallbacks=[],
         allow_reentry=True,
     )
-
-    app.add_handler(conv_add)
-    app.add_handler(conv_merge)
-    app.add_handler(conv_backup)
     app.add_handler(conv_edit)
 
-    # Navigation LAST + pattern دقیق (خیلی مهم)
-    # این باعث میشه add_panel و merge و backup_menu توسط nav_callbacks خورده نشه
+    # Navigation LAST + pattern دقیق
     app.add_handler(
         CallbackQueryHandler(
             nav_callbacks,
             pattern=r"^(back_main|manage_panels|start_merge|profile|panel:.*|del:.*|edit:.*)$",
         )
     )
+
+    app.add_error_handler(on_error)
 
     app.run_polling()
 

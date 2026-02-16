@@ -366,8 +366,6 @@ def _short(s: str, n: int = 1600) -> str:
     SRV_ADD_PANEL_USER,
     SRV_ADD_PANEL_PASS,
 
-    SRV_EDIT_VALUE,
-
     PORTS_COUNT,
     PORTS_ITEMS,
 
@@ -388,7 +386,8 @@ def _short(s: str, n: int = 1600) -> str:
     BK_IMPORT_NEW_SSH_PASS,
     BK_IMPORT_NEW_UPLOAD_FILE,
     BK_IMPORT_NEW_CONFIRM,
-) = range(31)
+) = range(29)
+
 
 # ------------------------- Start / Cancel -------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):

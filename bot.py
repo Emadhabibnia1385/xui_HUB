@@ -1,9 +1,8 @@
 import os
 import re
 import asyncio
-import tempfile
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import paramiko
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,15 +16,13 @@ from telegram.ext import (
     filters,
 )
 
-# ------------------------- Logging -------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("xuihub_merge_simple")
 
-
-# ------------------------- .env loader (optional) -------------------------
+# ------------------------- .env loader -------------------------
 def load_env_file(path: str) -> None:
     if not os.path.exists(path):
         return
@@ -43,7 +40,6 @@ def load_env_file(path: str) -> None:
     except Exception:
         logger.exception("Failed to load .env")
 
-
 def get_token() -> str:
     token = os.getenv("TOKEN", "").strip()
     if token:
@@ -55,59 +51,52 @@ def get_token() -> str:
     return token
 
 
-# ------------------------- Text/UI -------------------------
 START_TEXT = (
     "🤖 به **xuiHUB** خوش آمدید\n\n"
-    "این ربات یک کار ساده انجام می‌دهد:\n"
-    "🔀 ادغام کلاینت‌های چند Inbound داخل یک Inbound مقصد روی همان سرور\n\n"
-    "✅ فقط اطلاعات سرور و شماره Inboundها را می‌گیرد و ادغام می‌کند.\n"
-    "⛔️ هیچ Stop انجام نمی‌دهد و اگر خطا باشد دقیق گزارش می‌دهد.\n\n"
+    "این ربات برای ادغام کلاینت‌های چند Inbound داخل یک Inbound مقصد روی همان سرور ساخته شده است.\n\n"
+    "📌 مراحل:\n"
+    "1) IP\n"
+    "2) SSH User\n"
+    "3) SSH Pass\n"
+    "4) SSH Port\n"
+    "5) Target Inbound ID\n"
+    "6) Source Inbound IDs\n\n"
     "برای شروع روی دکمه زیر بزن 👇\n"
     "👨‍💻 توسعه‌دهنده: @EmadHabibnia"
 )
 
+def kb_main():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔀 شروع ادغام اینباند", callback_data="start_merge")]])
 
-def kb_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔀 شروع ادغام اینباند", callback_data="start_merge")],
-    ])
-
-
-def kb_confirm() -> InlineKeyboardMarkup:
+def kb_confirm():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ انجام بده", callback_data="do_merge"),
-         InlineKeyboardButton("❌ لغو", callback_data="cancel")],
+         InlineKeyboardButton("❌ لغو", callback_data="cancel")]
     ])
 
-
-# ------------------------- Validators -------------------------
 def is_ipv4(ip: str) -> bool:
     ip = (ip or "").strip()
     if not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", ip):
         return False
     try:
-        parts = [int(x) for x in ip.split(".")]
-        return all(0 <= p <= 255 for p in parts)
+        return all(0 <= int(x) <= 255 for x in ip.split("."))
     except Exception:
         return False
 
-
-def parse_int(s: str, min_v: int, max_v: int) -> Optional[int]:
+def parse_int(s: str, mn: int, mx: int):
     s = (s or "").strip()
     if not re.fullmatch(r"\d+", s):
         return None
     v = int(s)
-    if not (min_v <= v <= max_v):
+    if not (mn <= v <= mx):
         return None
     return v
 
-
-def _short(s: str, n: int = 1500) -> str:
+def _short(s: str, n: int = 2000) -> str:
     s = (s or "").strip()
     return s[:n] + ("…" if len(s) > n else "")
 
-
-# ------------------------- SSH helpers (robust) -------------------------
+# ------------------------- SSH helpers -------------------------
 def ssh_client(host: str, port: int, user: str, password: str, timeout: int = 20) -> paramiko.SSHClient:
     c = paramiko.SSHClient()
     c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -122,7 +111,6 @@ def ssh_client(host: str, port: int, user: str, password: str, timeout: int = 20
     )
     return c
 
-
 def ssh_exec_raw(c: paramiko.SSHClient, cmd: str, read_timeout: int = 35) -> Tuple[int, str, str]:
     _, stdout, stderr = c.exec_command(cmd, get_pty=True)
     try:
@@ -130,12 +118,10 @@ def ssh_exec_raw(c: paramiko.SSHClient, cmd: str, read_timeout: int = 35) -> Tup
         stderr.channel.settimeout(read_timeout)
     except Exception:
         pass
-
     out = stdout.read().decode("utf-8", errors="ignore")
     err = stderr.read().decode("utf-8", errors="ignore")
     code = stdout.channel.recv_exit_status()
     return code, out, err
-
 
 def ssh_exec(host: str, port: int, user: str, password: str, cmd: str,
              conn_timeout: int = 20, read_timeout: int = 35) -> Tuple[int, str, str]:
@@ -145,8 +131,7 @@ def ssh_exec(host: str, port: int, user: str, password: str, cmd: str,
     finally:
         c.close()
 
-
-# ------------------------- DB finder (fast) -------------------------
+# ------------------------- Commands -------------------------
 FIND_DB_CMD = r"""
 set -e
 for p in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db /opt/x-ui/x-ui.db /var/lib/x-ui/x-ui.db /root/x-ui.db; do
@@ -166,38 +151,49 @@ else
 fi
 """
 
-
 def make_merge_script() -> str:
-    # اسکریپت merge دقیقاً مثل نسخه‌ای که درست کار می‌کرد
+    # ✅ مسیر کامل sqlite3 + چک sudo
     return r"""
 set -e
 DB="$1"
 TARGET_ID="$2"
 SRC_IDS="$3"
 
-command -v sqlite3 >/dev/null 2>&1 || { echo "ERR_NO_SQLITE3"; exit 10; }
+SQLITE_BIN="/usr/bin/sqlite3"
+
+if [ ! -x "$SQLITE_BIN" ]; then
+  echo "ERR_SQLITE3_NOT_FOUND_AT_/usr/bin/sqlite3"
+  exit 10
+fi
+
 command -v python3 >/dev/null 2>&1 || { echo "ERR_NO_PYTHON3"; exit 13; }
+
+# sudo check
+if ! sudo -n true >/dev/null 2>&1; then
+  echo "ERR_SUDO_NEEDS_PASSWORD"
+  exit 40
+fi
 
 sudo -n cp "$DB" "/tmp/xuihub_db_backup_$(date +%s).db" >/dev/null 2>&1 || true
 
-HAS_CLIENTS=$(sudo -n sqlite3 "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='clients';")
+HAS_CLIENTS=$(sudo -n "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='clients';")
 if [ "$HAS_CLIENTS" != "0" ]; then
-  COLS=$(sudo -n sqlite3 "$DB" "SELECT group_concat(name, ',') FROM pragma_table_info('clients') WHERE name NOT IN ('id','inbound_id');")
+  COLS=$(sudo -n "$SQLITE_BIN" "$DB" "SELECT group_concat(name, ',') FROM pragma_table_info('clients') WHERE name NOT IN ('id','inbound_id');")
   if [ -z "$COLS" ]; then
     echo "ERR_NO_CLIENTS_TABLE"
     exit 11
   fi
 
-  HAS_UUID=$(sudo -n sqlite3 "$DB" "SELECT COUNT(*) FROM pragma_table_info('clients') WHERE name='uuid';")
+  HAS_UUID=$(sudo -n "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM pragma_table_info('clients') WHERE name='uuid';")
   if [ "$HAS_UUID" = "0" ]; then
     echo "ERR_NO_UUID"
     exit 12
   fi
 
   SELS=$(echo "$COLS" | awk -F',' '{for(i=1;i<=NF;i++){printf "c.%s", $i; if(i<NF) printf ","}}')
-  BEFORE=$(sudo -n sqlite3 "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
+  BEFORE=$(sudo -n "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
 
-  sudo -n sqlite3 "$DB" "BEGIN;
+  sudo -n "$SQLITE_BIN" "$DB" "BEGIN;
     INSERT INTO clients (inbound_id, $COLS)
     SELECT $TARGET_ID, $SELS
     FROM clients c
@@ -205,7 +201,7 @@ if [ "$HAS_CLIENTS" != "0" ]; then
       AND c.uuid NOT IN (SELECT uuid FROM clients WHERE inbound_id=$TARGET_ID);
     COMMIT;"
 
-  AFTER=$(sudo -n sqlite3 "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
+  AFTER=$(sudo -n "$SQLITE_BIN" "$DB" "SELECT COUNT(*) FROM clients WHERE inbound_id=$TARGET_ID;")
   ADDED=$((AFTER-BEFORE))
   echo "OK_MODE=TABLE OK_ADDED=$ADDED BEFORE=$BEFORE AFTER=$AFTER"
   exit 0
@@ -291,35 +287,19 @@ print(f"OK_MODE=JSON OK_ADDED={added} TARGET_CLIENTS={len(tclients)} SETTINGS_CO
 PY
 """
 
-
 # ------------------------- States -------------------------
 IP, SSH_USER, SSH_PASS, SSH_PORT, TARGET_ID, SRC_COUNT, SRC_IDS, CONFIRM = range(8)
 
-
-# ------------------------- Error reporting -------------------------
-async def send_error(update: Update, title: str, detail: str, extra: str = ""):
-    msg = f"❌ {title}\n{detail}"
-    if extra.strip():
-        msg += f"\n\nجزئیات:\n{_short(extra, 1800)}"
-    if update.message:
-        await update.message.reply_text(msg)
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(msg)
-
-
-# ------------------------- Handlers -------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(START_TEXT, reply_markup=kb_main(), parse_mode="Markdown")
-
 
 async def start_merge_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     context.user_data.clear()
-    await q.edit_message_text("📌 لطفاً IPv4 سرور را ارسال کنید:")
+    await q.edit_message_text("📌 IPv4 سرور را ارسال کنید:")
     return IP
-
 
 async def got_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ip = (update.message.text or "").strip()
@@ -330,27 +310,24 @@ async def got_ip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👤 یوزرنیم SSH را ارسال کنید (اگر root هستی /skip بزن):")
     return SSH_USER
 
-
 async def got_ssh_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
     user = "root" if txt == "/skip" else txt
     if not user:
-        await update.message.reply_text("❌ یوزرنیم خالیه. دوباره بفرست.")
+        await update.message.reply_text("❌ یوزرنیم خالیه.")
         return SSH_USER
     context.user_data["ssh_user"] = user
     await update.message.reply_text("🔑 پسورد SSH را ارسال کنید:")
     return SSH_PASS
 
-
 async def got_ssh_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pw = (update.message.text or "").strip()
     if not pw:
-        await update.message.reply_text("❌ پسورد خالیه. دوباره بفرست.")
+        await update.message.reply_text("❌ پسورد خالیه.")
         return SSH_PASS
     context.user_data["ssh_pass"] = pw
     await update.message.reply_text("🔢 پورت SSH را ارسال کنید (اگر 22 هست /skip بزن):")
     return SSH_PORT
-
 
 async def got_ssh_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (update.message.text or "").strip()
@@ -359,33 +336,30 @@ async def got_ssh_port(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ پورت معتبر نیست (1..65535).")
         return SSH_PORT
     context.user_data["ssh_port"] = port
-    await update.message.reply_text("🎯 شماره Inbound مقصد (Target ID) را ارسال کنید:")
+    await update.message.reply_text("🎯 Target Inbound ID را ارسال کنید:")
     return TARGET_ID
 
-
 async def got_target_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    v = parse_int((update.message.text or "").strip(), 1, 10**9)
+    v = parse_int(update.message.text, 1, 10**9)
     if v is None:
         await update.message.reply_text("❌ فقط عدد بفرست. مثال: 12")
         return TARGET_ID
     context.user_data["target_id"] = v
-    await update.message.reply_text("🔢 چند تا Inbound ورودی دارید؟ (1 تا 30)")
+    await update.message.reply_text("🔢 چندتا Source Inbound دارید؟ (1 تا 30)")
     return SRC_COUNT
 
-
 async def got_src_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n = parse_int((update.message.text or "").strip(), 1, 30)
+    n = parse_int(update.message.text, 1, 30)
     if n is None:
         await update.message.reply_text("❌ عدد معتبر بین 1 تا 30 بفرست.")
         return SRC_COUNT
     context.user_data["src_count"] = n
     context.user_data["src_ids"] = []
-    await update.message.reply_text("📥 حالا شماره Inbound ورودی 1 را ارسال کنید:")
+    await update.message.reply_text("📥 Source ID شماره 1 را بفرست:")
     return SRC_IDS
 
-
 async def got_src_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sid = parse_int((update.message.text or "").strip(), 1, 10**9)
+    sid = parse_int(update.message.text, 1, 10**9)
     if sid is None:
         await update.message.reply_text("❌ فقط عدد بفرست.")
         return SRC_IDS
@@ -396,26 +370,18 @@ async def got_src_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     n = int(context.user_data["src_count"])
     if len(src_ids) < n:
-        await update.message.reply_text(f"✅ ثبت شد. حالا شماره Inbound ورودی {len(src_ids)+1} را بفرست:")
+        await update.message.reply_text(f"✅ ثبت شد. Source ID شماره {len(src_ids)+1} را بفرست:")
         return SRC_IDS
 
-    # summary
-    ip = context.user_data["ip"]
-    user = context.user_data["ssh_user"]
-    port = context.user_data["ssh_port"]
-    target = context.user_data["target_id"]
-
     await update.message.reply_text(
-        "🧾 خلاصه عملیات:\n\n"
-        f"Server: {ip}:{port}\n"
-        f"SSH User: {user}\n"
-        f"Target Inbound ID: {target}\n"
-        f"Source IDs: {', '.join(str(x) for x in src_ids)}\n\n"
-        "اگر مطمئنی، روی «انجام بده» بزن ✅",
+        "🧾 خلاصه:\n"
+        f"Server: {context.user_data['ip']}:{context.user_data['ssh_port']}\n"
+        f"Target: {context.user_data['target_id']}\n"
+        f"Sources: {', '.join(str(x) for x in src_ids)}\n\n"
+        "اگر مطمئنی انجام بده ✅",
         reply_markup=kb_confirm(),
     )
     return CONFIRM
-
 
 async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -423,11 +389,8 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if q.data == "cancel":
         context.user_data.clear()
-        await q.edit_message_text("✅ لغو شد. برای شروع دوباره /start را بزن.")
+        await q.edit_message_text("✅ لغو شد. /start بزن برای شروع دوباره.")
         return ConversationHandler.END
-
-    if q.data != "do_merge":
-        return CONFIRM
 
     ip = context.user_data["ip"]
     ssh_user = context.user_data["ssh_user"]
@@ -436,39 +399,21 @@ async def confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_id = int(context.user_data["target_id"])
     src_ids = [int(x) for x in context.user_data.get("src_ids", [])]
 
-    await q.edit_message_text("⏳ شروع عملیات... اتصال به سرور")
-
+    await q.edit_message_text("⏳ اتصال به سرور...")
     try:
-        # 1) Find DB
-        await q.message.reply_text("🔎 در حال پیدا کردن دیتابیس x-ui.db ...")
-        try:
-            code, out, err = await asyncio.wait_for(
-                asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, FIND_DB_CMD, 20, 35),
-                timeout=45,
-            )
-        except asyncio.TimeoutError:
-            await send_error(update, "Timeout", "پیدا کردن دیتابیس طولانی شد/سرور پاسخ نداد.")
-            context.user_data.clear()
-            return ConversationHandler.END
-
+        # find db
+        code, out, err = await asyncio.wait_for(
+            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, FIND_DB_CMD, 20, 35),
+            timeout=45,
+        )
         db_path = (out or "").strip().splitlines()[-1] if (out or "").strip() else ""
-        if code != 0:
-            # خیلی وقتا به خاطر sudo -n است
-            await send_error(update, "خطا در پیدا کردن دیتابیس",
-                             "دستور اجرا شد ولی با خطا برگشت. احتمالاً sudo بدون پسورد نیست.",
-                             out + "\n" + err)
+        if code != 0 or not db_path or "NOT_FOUND" in db_path:
+            await q.message.reply_text("❌ دیتابیس پیدا نشد یا sudo ندارم.")
+            await q.message.reply_text(_short(out + "\n" + err))
             context.user_data.clear()
             return ConversationHandler.END
 
-        if not db_path or "NOT_FOUND" in db_path:
-            await send_error(update, "دیتابیس پیدا نشد",
-                             "x-ui.db پیدا نشد یا دسترسی sudo ندارم.")
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        await q.message.reply_text(f"✅ دیتابیس پیدا شد:\n{db_path}")
-
-        # 2) Run merge script
+        await q.message.reply_text(f"✅ دیتابیس: {db_path}")
         await q.message.reply_text("🧩 در حال اجرای Merge ...")
 
         src_csv = ",".join(str(x) for x in src_ids)
@@ -484,56 +429,51 @@ chmod +x "$TMP"
 sudo -n "$TMP" "{db_path}" "{target_id}" "{src_csv}"
 """
 
-        try:
-            code2, out2, err2 = await asyncio.wait_for(
-                asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, remote_cmd, 20, 80),
-                timeout=90,
-            )
-        except asyncio.TimeoutError:
-            await send_error(update, "Timeout در Merge",
-                             "اسکریپت ادغام طولانی شد یا گیر کرد.",
-                             "احتمال: sqlite3 یا sudo یا قفل دیتابیس")
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        if code2 != 0:
-            await send_error(update, "Merge ناموفق شد",
-                             "کد خروجی غیر صفر برگشت.",
-                             out2 + "\n" + err2)
-            context.user_data.clear()
-            return ConversationHandler.END
-
-        # 3) Report result (بدون ریستارت سرویس)
-        await q.message.reply_text(
-            "🎉 ادغام انجام شد ✅\n\n"
-            f"خروجی:\n{_short(out2, 3000)}"
+        code2, out2, err2 = await asyncio.wait_for(
+            asyncio.to_thread(ssh_exec, ip, ssh_port, ssh_user, ssh_pass, remote_cmd, 20, 90),
+            timeout=120,
         )
 
+        if code2 != 0:
+            msg = (out2 + "\n" + err2).strip()
+            # پیام‌های واضح‌تر
+            if "ERR_SUDO_NEEDS_PASSWORD" in msg:
+                await q.message.reply_text("❌ مشکل: sudo بدون پسورد نیست. باید NOPASSWD تنظیم کنی.")
+            elif "ERR_SQLITE3_NOT_FOUND" in msg:
+                await q.message.reply_text("❌ مشکل: sqlite3 در مسیر /usr/bin/sqlite3 پیدا نشد.")
+            else:
+                await q.message.reply_text("❌ Merge ناموفق شد.")
+            await q.message.reply_text(_short(msg, 3500))
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        await q.message.reply_text("🎉 ادغام انجام شد ✅")
+        await q.message.reply_text(_short(out2, 3500))
         context.user_data.clear()
         await q.message.reply_text("برای ادغام بعدی /start را بزن ✅", reply_markup=kb_main())
         return ConversationHandler.END
 
+    except asyncio.TimeoutError:
+        await q.message.reply_text("❌ Timeout: عملیات زیاد طول کشید یا سرور پاسخ نداد.")
+        context.user_data.clear()
+        return ConversationHandler.END
     except Exception as e:
         logger.exception("merge crashed")
-        await send_error(update, "خطای غیرمنتظره", str(e))
+        await q.message.reply_text(f"❌ خطای غیرمنتظره: {e}")
         context.user_data.clear()
         return ConversationHandler.END
 
-
-# ------------------------- Global error handler -------------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.exception("Unhandled exception: %s", context.error)
     try:
         if isinstance(update, Update):
             if update.message:
-                await update.message.reply_text("⚠️ یک خطای داخلی رخ داد. دوباره تلاش کن.")
+                await update.message.reply_text("⚠️ خطای داخلی رخ داد. دوباره تلاش کن.")
             elif update.callback_query:
-                await update.callback_query.message.reply_text("⚠️ یک خطای داخلی رخ داد. دوباره تلاش کن.")
+                await update.callback_query.message.reply_text("⚠️ خطای داخلی رخ داد. دوباره تلاش کن.")
     except Exception:
         pass
 
-
-# ------------------------- Main -------------------------
 def main():
     token = get_token()
     app = Application.builder().token(token).build()
@@ -559,7 +499,6 @@ def main():
 
     app.add_error_handler(on_error)
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()

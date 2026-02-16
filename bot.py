@@ -1371,7 +1371,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
 
-    # Conversations FIRST
+    # Conversations FIRST (خیلی مهم)
     conv_add = ConversationHandler(
         entry_points=[CallbackQueryHandler(add_panel_entry, pattern="^add_panel$")],
         states={
@@ -1389,7 +1389,6 @@ def main():
         fallbacks=[],
         allow_reentry=True,
     )
-    app.add_handler(conv_add)
 
     conv_merge = ConversationHandler(
         entry_points=[CallbackQueryHandler(merge_entry, pattern=r"^merge:")],
@@ -1402,7 +1401,6 @@ def main():
         fallbacks=[],
         allow_reentry=True,
     )
-    app.add_handler(conv_merge)
 
     conv_backup = ConversationHandler(
         entry_points=[CallbackQueryHandler(backup_menu_entry, pattern="^backup_menu$")],
@@ -1423,19 +1421,27 @@ def main():
         fallbacks=[],
         allow_reentry=True,
     )
-    app.add_handler(conv_backup)
 
-    # Edit: فقط وقتی field=value باشد
     conv_edit = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^[a-zA-Z_]+=") & ~filters.COMMAND, edit_value)],
         states={EDIT_VALUE: [MessageHandler(filters.Regex(r"^[a-zA-Z_]+=") & ~filters.COMMAND, edit_value)]},
         fallbacks=[],
         allow_reentry=True,
     )
+
+    app.add_handler(conv_add)
+    app.add_handler(conv_merge)
+    app.add_handler(conv_backup)
     app.add_handler(conv_edit)
 
-    # Navigation AFTER conversations
-    app.add_handler(CallbackQueryHandler(nav_callbacks))
+    # Navigation LAST + pattern دقیق (خیلی مهم)
+    # این باعث میشه add_panel و merge و backup_menu توسط nav_callbacks خورده نشه
+    app.add_handler(
+        CallbackQueryHandler(
+            nav_callbacks,
+            pattern=r"^(back_main|manage_panels|start_merge|profile|panel:.*|del:.*|edit:.*)$",
+        )
+    )
 
     app.run_polling()
 
